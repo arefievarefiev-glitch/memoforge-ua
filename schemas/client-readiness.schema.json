@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gregmos/memoforge/schemas/client-readiness.schema.json",
+  "title": "memoforge reviews/final-client-readiness.json",
+  "description": "client-readiness-reviewer verdict for one draft version; `issues[]` doubles as the polish instruction list, so every issue carries a section_id (TZ v1.5 section 2.1 phase 14, section 4.1). `reasoning` MUST be emitted as the first key, as for the revision-loop reviewers.",
+  "type": "object",
+  "required": ["reasoning", "reviewer", "draft_sha", "verdict", "issues"],
+  "additionalProperties": false,
+  "properties": {
+    "reasoning": { "type": "string", "minLength": 1 },
+    "reviewer": { "const": "client_readiness" },
+    "draft_sha": {
+      "description": "sha of the version reviewed; export pins the verdict to it (TZ section 2.1 phase 14).",
+      "$ref": "#/$defs/sha256"
+    },
+    "version_reviewed": { "type": "integer", "minimum": 1 },
+    "checklist": {
+      "description": "Binary grader items from lib/checklists/client-readiness.json; optional because the delivery review may run without a checklist file.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/checklist_item" }
+    },
+    "verdict": {
+      "enum": ["client_ready", "needs_final_polish", "manual_review_required"]
+    },
+    "issues": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/issue" }
+    },
+    "dispositions": {
+      "description": "D-211: one row per open substantive finding of the review loop (`state.open_substance_majors`, `origin: loop`) listed in the prompt. Optional: a report without open findings, or written before D-211, has none.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/disposition" }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "disposition": {
+      "description": "D-211, D-237: `polish` asks the polish pass to withdraw or soften the flagged statement (any class); `manual_review` hands the finding to a lawyer and lists it in the memo's Status section; `leave` (logic, counterarguments) keeps it for `summary.md`. An action the row's class does not allow counts as the class default.",
+      "type": "object",
+      "required": ["id", "action", "note"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^om-[1-9][0-9]*$" },
+        "action": { "enum": ["polish", "manual_review", "leave"] },
+        "note": { "type": "string", "minLength": 1 }
+      }
+    },
+    "checklist_item": {
+      "type": "object",
+      "required": ["id", "pass", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "pass": { "enum": [true, false, "unknown"] },
+        "evidence": { "type": "string", "minLength": 1 }
+      }
+    },
+    "issue": {
+      "type": "object",
+      "required": ["section_id", "severity", "issue", "suggestion"],
+      "additionalProperties": false,
+      "properties": {
+        "section_id": { "type": "string", "minLength": 1 },
+        "severity": { "enum": ["blocker", "major", "minor"] },
+        "issue": { "type": "string", "minLength": 1 },
+        "suggestion": { "type": "string", "minLength": 1 },
+        "issue_client": {
+          "description": "D-173a: one client-facing sentence in the memo language (only when it is not `en`).",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400
+        }
+      }
+    }
+  }
+}

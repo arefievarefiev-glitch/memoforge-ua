@@ -1,0 +1,1357 @@
+"""Golden tests for `scripts/memoforge/docx/renderer.py` — the AST branch of the export (ТЗ §5.5).
+
+Each case renders one draft and compares the normalised `word/document.xml` and `word/footnotes.xml`
+against the fixtures in `fixtures/docx/`. Normalisation drops the namespace declarations and the
+`w:rsid*` revision-tracking attributes Word writes and prints one element per line, so a fixture is
+readable in review and stable across runs. `MEMOFORGE_UPDATE_GOLDEN=1` rewrites the fixtures.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+from unittest import mock
+from xml.sax.saxutils import escape, quoteattr
+
+from lxml import etree
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[2]
+if str(PLUGIN_ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _i18n  # noqa: E402
+from memoforge import fallbacks, i18n  # noqa: E402
+from memoforge.docx import fallback, oscola, renderer, validate  # noqa: E402
+import _legacy_manifest  # noqa: E402
+
+
+def setUpModule() -> None:
+    _legacy_manifest.install()
+
+
+def tearDownModule() -> None:
+    _legacy_manifest.uninstall()
+from test_docx_fallback import (  # noqa: E402
+    CASUS_ENDPOINT,
+    LINK_LESS_RECORD,
+    RU_DELIVERABLE,
+    RU_TEXT_NOTES,
+    issue_step,
+    warnings_fixture,
+)
+
+GOLDEN_DIR = Path(__file__).resolve().parent / "fixtures" / "docx"
+UPDATE_GOLDEN = os.environ.get("MEMOFORGE_UPDATE_GOLDEN") == "1"
+
+DOCUMENT_PART = "word/document.xml"
+FOOTNOTES_PART = "word/footnotes.xml"
+STYLES_PART = "word/styles.xml"
+
+STATUS_LABEL = fallback.label("status_label")
+STATUS_BANNERS_LABEL = fallback.label("status_banners_label")
+STATUS_ISSUES_LABEL = fallback.label("status_issues_label")
+APPENDIX_HEADING = fallback.label("appendix_heading")
+"""The English labels of the docx deliverable, read the same way the renderer writes them."""
+
+NAMESPACE_PREFIX = {
+    "http://schemas.openxmlformats.org/wordprocessingml/2006/main": "w",
+    "http://schemas.openxmlformats.org/markup-compatibility/2006": "mc",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships": "r",
+    "http://schemas.microsoft.com/office/word/2010/wordml": "w14",
+    "http://www.w3.org/XML/1998/namespace": "xml",
+}
+
+
+def _name(tag: str) -> str:
+    if tag.startswith("{"):
+        uri, local = tag[1:].split("}", 1)
+        return f"{NAMESPACE_PREFIX.get(uri, uri)}:{local}"
+    return tag
+
+
+def _attributes(element) -> str:
+    parts = []
+    for key, value in sorted(element.attrib.items()):
+        name = _name(key)
+        if name.startswith("w:rsid") or name == "mc:Ignorable":
+            continue
+        parts.append(f'{name}="{quoteattr(value)[1:-1]}"')
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def _dump(element, depth: int, out: list[str]) -> None:
+    tag = _name(element.tag)
+    head = f"{'  ' * depth}<{tag}{_attributes(element)}"
+    text = escape(element.text or "")
+    if len(element) == 0:
+        out.append(f"{head}>{text}</{tag}>" if text else f"{head}/>")
+        return
+    out.append(f"{head}>")
+    for child in element:
+        _dump(child, depth + 1, out)
+    out.append(f"{'  ' * depth}</{tag}>")
+
+
+def normalise(blob: bytes) -> str:
+    """One element per line, without namespace declarations or `w:rsid*` attributes."""
+    out: list[str] = []
+    _dump(etree.fromstring(blob), 0, out)
+    return "\n".join(out) + "\n"
+
+
+def sample_index() -> fallback.SourceIndex:
+    """One source of each layer plus a quote pointing at the case (§5.3 registry shape)."""
+    return fallback.SourceIndex(
+        snapshot_ids=["gdpr", "schrems", "edpb"],
+        entries={
+            "gdpr": {
+                "source_id": "gdpr",
+                "layer": "statutes",
+                "title": "General Data Protection Regulation",
+                "citation_form": "Regulation (EU) 2016/679",
+                "identifiers": {"celex": "32016R0679"},
+                "url": "https://eur-lex.europa.eu/eli/reg/2016/679/oj",
+                "retrieved_at": "2026-09-01T10:00:00Z",
+            },
+            "schrems": {
+                "source_id": "schrems",
+                "layer": "case_law",
+                "title": "Data Protection Commissioner v Facebook Ireland Ltd (Schrems II)",
+                "citation_form": "Case C-311/18",
+                "identifiers": {"ecli": "ECLI:EU:C:2020:559"},
+                "url": "https://curia.europa.eu/juris/c-311-18",
+                "retrieved_at": "2026-09-01T10:00:00Z",
+            },
+            "edpb": {
+                "source_id": "edpb",
+                "layer": "doctrine",
+                "title": "Guidelines 05/2020 on consent",
+                "citation_form": "EDPB Guidelines 05/2020",
+                "url": "https://edpb.europa.eu/guidelines-05-2020",
+                "retrieved_at": "2026-09-02T09:00:00Z",
+            },
+        },
+        sources={
+            "gdpr": {"meta": {"short_name": "GDPR"}, "currency": {"status": "ok"}},
+            "edpb": {
+                "meta": {
+                    "issuing_body": "European Data Protection Board",
+                    "date": "2020-05-04",
+                    "short_name": "EDPB Guidelines 05/2020",
+                }
+            },
+        },
+        quotes={"q-001": {"source_id": "schrems"}},
+        frozen=True,
+    )
+
+
+class GoldenCase(unittest.TestCase):
+    """Shared machinery: render one draft, compare both parts against `fixtures/docx/`."""
+
+    def render(self, draft: str, **kwargs) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        target = Path(tmp.name) / "memo.docx"
+        kwargs.setdefault("index", sample_index())
+        # D-150: the styles are covered by `CitationStyleTest`; every other case keeps the footnote
+        # apparatus it was written for, so its golden stays a golden of that machinery.
+        kwargs.setdefault("citation_style", oscola.STYLE_FOOTNOTES)
+        index = kwargs.pop("index")
+        self.result = renderer.render(draft, index, target, **kwargs)
+        return target
+
+    def assertGolden(self, name: str, path: Path) -> None:
+        with zipfile.ZipFile(path) as archive:
+            parts = {
+                "document.xml": archive.read(DOCUMENT_PART),
+                "footnotes.xml": archive.read(FOOTNOTES_PART),
+            }
+        for suffix, blob in parts.items():
+            golden = GOLDEN_DIR / f"{name}.{suffix}"
+            actual = normalise(blob)
+            if UPDATE_GOLDEN:
+                golden.parent.mkdir(parents=True, exist_ok=True)
+                golden.write_bytes(actual.encode("utf-8"))
+                continue
+            self.assertTrue(golden.is_file(), f"missing golden fixture {golden}")
+            self.assertEqual(
+                golden.read_text(encoding="utf-8"),
+                actual,
+                f"{name}/{suffix} drifted from its golden fixture",
+            )
+
+
+class HeadingsAndParagraphsTest(GoldenCase):
+    """Headings keep their markdown numbering; soft-wrapped lines join into one paragraph (§5.5)."""
+
+    DRAFT = (
+        "# 1. Executive summary\n\n"
+        "<!-- §s-1 -->\n\n"
+        "First line of the paragraph,\nsoft wrapped onto a second line.\n\n"
+        "## 2. Background\n\n"
+        "### 2.1. Definitions\n\n"
+        "Body with **bold**, *italic*, `code` and [the register](https://example.org/reg).\n"
+    )
+
+    def test_headings_paragraphs_and_soft_wrap(self):
+        self.assertGolden("headings", self.render(self.DRAFT))
+
+    def test_soft_wrap_stays_in_one_paragraph(self):
+        path = self.render(self.DRAFT)
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        self.assertIn("soft wrapped onto a second line.", text)
+        self.assertNotIn("<w:br/>", text)
+
+    def test_a_link_renders_as_text_plus_url(self):
+        path = self.render(self.DRAFT)
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        self.assertIn("the register", text)
+        self.assertIn("&lt;https://example.org/reg&gt;", text)
+
+
+class ListsTest(GoldenCase):
+    """§5.5: a new `w:num` per list, so the second numbered list restarts at 1."""
+
+    TWO_LISTS = "1. alpha\n2. beta\n\nProse between the lists.\n\n1. gamma\n2. delta\n"
+    NESTED = "- top level\n- second\n  - nested a\n  - nested b\n"
+    STANDALONE = "Prose paragraph.\n\n2. This line is prose, not a list item.\n"
+
+    def test_two_numbered_lists_get_separate_numbering(self):
+        self.assertGolden("lists_restart", self.render(self.TWO_LISTS))
+
+    def test_each_list_allocates_its_own_num_id(self):
+        path = self.render(self.TWO_LISTS)
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        num_ids = sorted({line.split('"')[1] for line in text.splitlines() if "<w:numId" in line})
+        self.assertEqual(2, len(num_ids), "each markdown list restarts on its own w:num")
+
+    def test_nested_bullets_use_the_level_two_style(self):
+        self.assertGolden("nested_bullets", self.render(self.NESTED))
+
+    def test_a_standalone_numbered_line_is_a_paragraph(self):
+        path = self.render(self.STANDALONE)
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        self.assertIn('<w:t xml:space="preserve">2. </w:t>', text)
+        self.assertNotIn("ListNumber", text)
+
+    def test_three_level_bullets_carry_the_word_list_glyphs(self):
+        # D-188: level 0 is U+F0B7/Symbol (U+2022 has no Symbol glyph and prints an empty box),
+        # level 1 `o`/Courier New, level 2 U+F0A7/Wingdings — Word's own built-in list definitions.
+        # The pairs are asserted on the renderer's own `w:abstractNum` (the one the list's `w:num`
+        # points at), not on python-docx's template definitions.
+        from lxml import etree as _etree
+
+        path = self.render("- a\n  - b\n    - c\n")
+        namespaces = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        with zipfile.ZipFile(path) as archive:
+            document = _etree.fromstring(archive.read(DOCUMENT_PART))
+            numbering = _etree.fromstring(archive.read("word/numbering.xml"))
+        paragraph = next(
+            node
+            for node in document.findall(".//w:p", namespaces)
+            if node.find("w:pPr/w:numPr", namespaces) is not None
+        )
+        num_id = paragraph.find("w:pPr/w:numPr", namespaces).find("w:numId", namespaces).get(
+            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val"
+        )
+        abstract_id = numbering.find(f".//w:num[@w:numId='{num_id}']/w:abstractNumId", namespaces).get(
+            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val"
+        )
+        abstract = numbering.find(f".//w:abstractNum[@w:abstractNumId='{abstract_id}']", namespaces)
+        self.assertIsNotNone(abstract, "the rendered list points at a renderer-owned abstractNum")
+        qn = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        pairs = {}
+        for level in abstract.findall("w:lvl", namespaces):
+            ilvl = level.get(f"{qn}ilvl")
+            glyph = level.find("w:lvlText", namespaces).get(f"{qn}val")
+            font = level.find("w:rPr/w:rFonts", namespaces).get(f"{qn}ascii")
+            pairs[ilvl] = (glyph, font)
+        self.assertEqual(("\uf0b7", "Symbol"), pairs["0"])
+        self.assertEqual(("o", "Courier New"), pairs["1"])
+        self.assertEqual(("\uf0a7", "Wingdings"), pairs["2"])
+        for glyph, font in pairs.values():
+            self.assertFalse(glyph == "•" and font == "Symbol")
+
+
+class TableTest(GoldenCase):
+    DRAFT = "| Rule | Effect |\n|---|---|\n| a \\| b | applies |\n"
+
+    def test_table_with_an_escaped_pipe(self):
+        self.assertGolden("table_escaped_pipe", self.render(self.DRAFT))
+
+    def test_the_escaped_pipe_survives_as_text(self):
+        path = self.render(self.DRAFT)
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        self.assertIn("<w:t>|</w:t>", text)
+        self.assertIn('<w:tblStyle w:val="TableGrid"/>', text)
+
+
+class FootnoteTest(GoldenCase):
+    """One footnote per mention; the repeat mention gets the short form (§5.5)."""
+
+    QUOTE = "Adequacy is the test.\n\n> Essentially equivalent protection. [[q:q-001]]\n"
+    REPEAT = (
+        "Lawful basis [[src:gdpr art 6(1)(f)]] and the case [[src:schrems para 168]].\n\n"
+        "Later again [[src:gdpr art 7]].\n"
+    )
+    TYPES = "Legislation [[src:gdpr]], case [[src:schrems]], guidance [[src:edpb]].\n"
+    UNRESOLVED = "Cited [[src:ghost-source]] and quoted [[q:q-999]].\n"
+
+    def test_blockquote_with_a_quote_token(self):
+        self.assertGolden("blockquote_quote", self.render(self.QUOTE))
+
+    def test_the_quote_token_is_removed_from_the_blockquote(self):
+        path = self.render(self.QUOTE)
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        self.assertNotIn("[[q:", text)
+        self.assertIn('<w:footnoteReference w:id="1"/>', text)
+
+    def test_the_citation_is_an_attribution_under_the_quote_not_inside_it(self):
+        """D34-22: `> [2] (b) processing …` reads as part of the quoted rule; `— [2]` does not."""
+        path = self.render(self.QUOTE)
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        paragraphs = text.split("<w:p>")
+        quoted = next(row for row in paragraphs if "Essentially equivalent" in row)
+        self.assertNotIn("footnoteReference", quoted, "the quote stays the verbatim rule")
+        self.assertIn("<w:t>Essentially equivalent protection.</w:t>", quoted)
+        attribution = paragraphs[paragraphs.index(quoted) + 1]
+        self.assertIn(f'<w:t xml:space="preserve">{escape(fallback.ATTRIBUTION_PREFIX)}</w:t>', attribution)
+        self.assertIn('<w:footnoteReference w:id="1"/>', attribution)
+
+    def test_a_marker_leading_the_quote_leaves_no_space_behind(self):
+        path = self.render("> [[q:q-001]] Essentially equivalent protection.\n")
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        self.assertIn("<w:t>Essentially equivalent protection.</w:t>", text)
+
+    def test_first_and_repeat_mention(self):
+        self.assertGolden("repeat_mention", self.render(self.REPEAT))
+
+    def test_the_repeat_mention_is_a_short_form_pointing_at_the_first_footnote(self):
+        self.render(self.REPEAT)
+        forms = [(row["n"], row["form"], row["first_n"]) for row in self.result["footnotes"]]
+        self.assertEqual([(1, "full", 1), (2, "full", 2), (3, "short", 1)], forms)
+        self.assertIn("(n 1)", self.result["footnotes"][2]["text"])
+
+    def test_three_oscola_types(self):
+        self.assertGolden("oscola_types", self.render(self.TYPES))
+
+    def test_unresolved_ids_stay_in_the_text_without_a_footnote(self):
+        self.assertGolden("unresolved", self.render(self.UNRESOLVED))
+
+    def test_unresolved_raises_the_banner_and_no_footnote(self):
+        self.render(self.UNRESOLVED)
+        self.assertEqual(["ghost-source", "q-999"], self.result["unresolved"])
+        self.assertEqual([], self.result["footnotes"])
+        self.assertEqual(
+            ["unresolved_reference"], [row["banner_id"] for row in self.result["banners"]]
+        )
+
+    def test_every_reference_has_a_footnote_of_the_same_id(self):
+        path = self.render(self.REPEAT)
+        with zipfile.ZipFile(path) as archive:
+            document = archive.read(DOCUMENT_PART).decode("utf-8")
+            footnotes = archive.read(FOOTNOTES_PART).decode("utf-8")
+        for number in (1, 2, 3):
+            self.assertIn(f'<w:footnoteReference w:id="{number}"/>', document)
+            self.assertIn(f'<w:footnote w:id="{number}">', footnotes)
+
+
+class BannerTest(GoldenCase):
+    DRAFT = "Body of the memo.\n"
+
+    def test_status_banner(self):
+        path = self.render(
+            self.DRAFT,
+            final_status="manual_review_required_on_v2",
+            final_status_reasons=["no_checked_draft"],
+            banners=[
+                {
+                    "banner_id": "no_checked_draft",
+                    "condition_key": "no_checked_draft",
+                    "text": "No draft version passed lint and citation checks.",
+                }
+            ],
+        )
+        self.assertGolden("banner", path)
+
+    def test_the_banner_prints_the_status_and_the_reason_in_words(self):
+        # D-197: the yellow banner is the first thing the reader sees; no code belongs in it.
+        path = self.render(
+            self.DRAFT,
+            final_status="manual_review_required_on_v2",
+            final_status_reasons=["no_checked_draft"],
+        )
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        self.assertNotIn("manual_review_required_on_v2", text)
+        self.assertNotIn("no_checked_draft", text)
+        self.assertIn(escape(fallback.status_name("manual_review_required_on_v2")), text)
+        self.assertIn(escape(fallback.reason_name("no_checked_draft")), text)
+
+    def test_no_banner_on_an_approved_run(self):
+        path = self.render(self.DRAFT, final_status="approved_v3")
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        self.assertNotIn("MANUAL REVIEW REQUIRED", text)
+        self.assertNotIn("FFF3CD", text)
+
+    def test_banner_titles_follow_the_final_status(self):
+        self.assertEqual(
+            "REVIEWER NOTES NOT FULLY RESOLVED", renderer.banner_title("forced_exit_on_v2", [])
+        )
+        self.assertEqual(
+            "USER ACCEPTED EARLY — REMAINING ISSUES", renderer.banner_title("accepted_early", [])
+        )
+        self.assertEqual(
+            "MANUAL REVIEW REQUIRED", renderer.banner_title("manual_review_required_on_v2", [])
+        )
+        self.assertEqual(
+            "PIPELINE FALLBACK NOTICE — REVIEW BEFORE CLIENT USE",
+            renderer.banner_title("approved_v3", [{"banner_id": "x", "text": "y"}]),
+        )
+
+
+class SourcesSectionTest(GoldenCase):
+    def test_sources_are_generated_at_the_marker(self):
+        path = self.render(
+            "Body [[src:gdpr]].\n\nTail paragraph.\n\n<!-- sources: generated -->\n"
+        )
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        self.assertNotIn("sources: generated", text)
+        self.assertIn("<w:t>Sources</w:t>", text)
+        self.assertIn("CELEX 32016R0679", text)
+
+    def test_only_cited_sources_are_listed(self):
+        path = self.render("Body [[src:gdpr]].\n\n<!-- sources: generated -->\n")
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        # D-150: the annex names the instrument once; article-level titles are not printed.
+        self.assertIn("[1] Regulation (EU) 2016/679 (GDPR) —", text)
+        self.assertNotIn("General Data Protection Regulation", text)
+        self.assertNotIn("Schrems II", text)
+
+    def test_the_appendix_carries_unverified_sources_and_unresolved_ids(self):
+        # D-191: warnings live in the facts section; the appendix opens for unverified sources
+        # and unresolved markers only.
+        index = sample_index()
+        index.snapshot_ids.append("stale")
+        index.sources["stale"] = {
+            "citation_form": "Some Circular 2011",
+            "verification": {"us": "unresolved", "us_by": "agent", "eu_syntax_ok": True},
+            "currency": {"status": "manual_check"},
+            "liveness": {"status": "dead", "code": 404},
+        }
+        path = self.render(
+            "Body [[src:ghost]] and [[src:stale]].\n",
+            index=index,
+            drafting_warnings=[{"code": "research_partial", "message": "case_law incomplete"}],
+        )
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        self.assertIn("Unverified Sources", text)
+        self.assertNotIn("Assumptions", text)
+        self.assertNotIn("case_law incomplete", text)
+        self.assertIn("Some Circular 2011", text)
+        self.assertIn("ghost", text)
+
+    def test_the_docx_appendix_matches_the_markdown_fallback(self):
+        """D-191: `deliverable.docx` and `deliverable.md` carry the same appendix (no warnings)."""
+        index = sample_index()
+        index.currency_unavailable = True
+        index.snapshot_ids.extend(["stale", "quiet"])
+        index.sources["stale"] = {
+            "citation_form": "Some Circular 2011",
+            "currency": {"status": "unchecked"},
+            "liveness": {"status": "changed"},
+        }
+        index.sources["quiet"] = {
+            "citation_form": "Only currency was unchecked",
+            "currency": {"status": "unchecked"},
+        }
+        path = self.render(
+            "Body [[src:stale]] and [[src:quiet]].\n",
+            index=index,
+            drafting_warnings=warnings_fixture(),
+        )
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        # D-197: the `## Sources` annex records the currency of every cited work; the appendix
+        # discloses only what needs a human, so the assertions below are about the appendix.
+        appendix = text.partition(escape(fallback.label("appendix_heading")))[2]
+
+        self.assertEqual(1, text.count(escape(fallback.label('currency_unavailable_note'))))
+        self.assertNotIn("currency unchecked", appendix)
+        self.assertIn(escape("Some Circular 2011 — link changed"), appendix)
+        self.assertNotIn("Only currency was unchecked", appendix)
+        self.assertNotIn("research/doctrine.json", text)
+        self.assertNotIn("unresolved_research_gap", text)
+        self.assertNotIn("Assumption ", text)
+
+    def test_warnings_alone_write_no_docx_appendix(self):
+        # D-191: warnings without unverified sources, the currency note or unresolved ids.
+        path = self.render("Body.\n", drafting_warnings=[{"code": "gap", "message": "A gap."}])
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        self.assertNotIn(escape(fallback.label("appendix_heading")), text)
+
+
+class TextKindAppendixTest(GoldenCase):
+    """D-204: the docx appendix says what each cited text is, with the words of the markdown one."""
+
+    KINDS = {
+        # source id: (pack raw_kind, snapshot text digest, snapshot original digest, registry extras)
+        "ex": ("excerpt", "c" * 64, None, {}),
+        "sum": ("agent_summary", "c" * 64, None, {}),
+        "nr": ("excerpt", "c" * 64, None, {"meta": {"text_outcome": "excerpt:no_reasoning"}}),
+        "scan": ("none", None, "d" * 64, {}),
+        "gone": ("none", None, None, {"raw_original_sha256": "e" * 64}),
+        "client": ("client_file", "c" * 64, None, {"currency": {"status": "unchecked"}}),
+        "full": ("full_text", "c" * 64, None, {}),
+        # Controller's ruling: a `supporting` agent copy is disclosed too (C-08 stays `critical`).
+        "sup": ("agent_summary", "c" * 64, None, {"tier": "supporting"}),
+        "bg": ("agent_summary", "c" * 64, None, {"tier": "background"}),
+    }
+    DRAFT = " ".join(f"Point [[src:{source_id} ст. 9]]." for source_id in KINDS) + "\n"
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patcher = mock.patch.object(i18n, "PACK_DIR", Path(tmp.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        _i18n.fake_pack(Path(tmp.name), "ru", dict(RU_DELIVERABLE, **RU_TEXT_NOTES))
+
+    def index(self) -> fallback.SourceIndex:
+        records, entries = {}, {}
+        for source_id, (kind, _digest, _original, extra) in self.KINDS.items():
+            records[source_id] = {
+                "source_id": source_id,
+                "tier": "critical",
+                "citation_form": f"Act {source_id}",
+                "url": f"https://example.org/{source_id}",
+                "layer": "case_law",
+                **extra,
+            }
+            entries[source_id] = {
+                "source_id": source_id,
+                "tier": "critical",
+                "citation_form": f"Act {source_id}",
+                "raw_kind": kind,
+            }
+        return fallback.SourceIndex(
+            snapshot_ids=list(self.KINDS),
+            snapshot_hashes={source_id: row[1] for source_id, row in self.KINDS.items()},
+            snapshot_originals={source_id: row[2] for source_id, row in self.KINDS.items() if row[2]},
+            entries=entries,
+            sources=records,
+            frozen=True,
+            pinpoints_not_in_raw={"full": ["ст. 9"]},
+        )
+
+    def appendix(self, language: str) -> str:
+        path = self.render(self.DRAFT, index=self.index(), language=language)
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        return text.partition(escape(fallback.label("appendix_heading", language)))[2]
+
+    def test_each_line_prints_for_its_kind_in_en_and_ru(self):
+        for language in ("en", "ru"):
+            with self.subTest(language=language):
+                appendix = self.appendix(language)
+                expected = {
+                    "ex": fallback.label("excerpt_note", language),
+                    "sum": fallback.label("agent_summary_note", language),
+                    "nr": fallback.label("no_reasoning_note", language),
+                    "scan": fallback.label("pdf_unverified_note", language),
+                    "gone": fallback.label("no_saved_text_note", language),
+                    "full": fallback.label(
+                        "pinpoint_not_in_raw_note", language, pinpoint="ст. 9", source_id="full"
+                    ),
+                    "sup": fallback.label("agent_summary_note", language),
+                }
+                for source_id, note in expected.items():
+                    self.assertIn(escape(f"Act {source_id} — {note}"), appendix, source_id)
+                self.assertEqual(1, appendix.count(escape(fallback.label("no_saved_text_note", language))))
+                self.assertNotIn("Act client", appendix, "a client file with unchecked currency prints nothing")
+                self.assertNotIn("Act bg", appendix, "a background source's text is not disclosed")
+
+    def test_the_docx_and_the_markdown_appendix_carry_the_same_lines(self):
+        docx_appendix = self.appendix("en")
+        markdown = fallback.render(self.DRAFT, self.index())["markdown"]
+        md_appendix = markdown.partition(fallback.appendix_heading())[2]
+        for row in self.index().unverified_rows("en", {source_id for source_id in self.KINDS}):
+            line = fallback.unverified_line(row)
+            self.assertIn(escape(line), docx_appendix)
+            self.assertIn(f"- {line}", md_appendix)
+
+
+class StatusSectionTest(GoldenCase):
+    """D34-11: the docx carries the same `Status` section as the markdown deliverable."""
+
+    def status_paragraphs(self, path: Path) -> list[str]:
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        tail = text.partition(f"<w:t>{STATUS_LABEL}</w:t>")[2]
+        return [row.split(">", 1)[1].rsplit("<", 1)[0] for row in tail.splitlines() if "<w:t" in row]
+
+    def render_forced_exit(self, draft: str = "Body of the memo.\n", **kwargs):
+        payload = {
+            "final_status": "forced_exit_on_v1_with_remaining_issues",
+            "banners": [
+                {"banner_id": "forced_exit", "text": "REVIEWER NOTES NOT FULLY RESOLVED."}
+            ],
+            "remaining_blocking_issues": [
+                {"severity": "blocker", "section_id": "s-2", "issue": "Art. 17(1) carries no rule."}
+            ],
+        }
+        payload.update(kwargs)
+        return self.render(draft, **payload)
+
+    def test_the_banners_and_the_blockers_are_printed_under_the_heading(self):
+        rows = self.status_paragraphs(self.render_forced_exit())
+        self.assertIn("REVIEWER NOTES NOT FULLY RESOLVED.", rows)
+        # D-197: the section anchor and the status code are spelled out for the reader.
+        self.assertIn(escape("blocker · section 2 · Art. 17(1) carries no rule."), rows)
+        self.assertFalse(any("forced_exit_on_v1_with_remaining_issues" in row for row in rows))
+        name = fallback.status_name("forced_exit_on_v1_with_remaining_issues")
+        self.assertTrue(any(name in row for row in rows), rows)
+        self.assertIn(STATUS_BANNERS_LABEL, rows)
+        self.assertIn(STATUS_ISSUES_LABEL, rows)
+
+    def test_the_status_section_stands_before_the_appendix(self):
+        # D-191: an unresolved marker opens the appendix after the status section.
+        path = self.render_forced_exit(draft="Body [[src:ghost]].\n")
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        self.assertLess(
+            text.index(f"<w:t>{STATUS_LABEL}</w:t>"),
+            text.index(escape(APPENDIX_HEADING)),
+        )
+
+    def test_an_approved_run_carries_no_status_section(self):
+        path = self.render("Body of the memo.\n", final_status="approved_v3")
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        self.assertNotIn(f"<w:t>{STATUS_LABEL}</w:t>", text)
+        self.assertFalse(self.result["status_required"])
+
+    def test_the_footnotes_map_tells_the_validator_the_section_was_owed(self):
+        self.render_forced_exit()
+        self.assertTrue(renderer.footnotes_map(self.result)["status_required"])
+        self.render("Body of the memo.\n", final_status="client_ready_on_v2")
+        self.assertFalse(renderer.footnotes_map(self.result)["status_required"])
+
+
+RUN_20260922 = Path(__file__).resolve().parent / "fixtures" / "run-20260922"
+
+
+class ForcedExitTextTest(GoldenCase):
+    """D-216: run 74 printed its banner three times and pointed the reader at the wrong section."""
+
+    def forced_exit(self, extra_banners: tuple = ()) -> tuple[str, str]:
+        # Fix round 1: the fixture's own saved banners, stored text "(listed in the appendix)" and all.
+        state = json.loads((RUN_20260922 / "state-exit.json").read_text(encoding="utf-8"))
+        self.assertIn("(listed in the appendix)", state["fallback_banners"][0]["text"])
+        path = self.render(
+            "Body of the memo.\n",
+            final_status=state["final_status"],
+            final_status_reasons=state["final_status_reasons"],
+            banners=[*state["fallback_banners"], *extra_banners],
+            remaining_blocking_issues=state["remaining_blocking_issues"],
+        )
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        return text, fallbacks.banner("max_iterations_with_blockers", count=1)["text"]
+
+    def test_the_banner_text_is_printed_once_in_the_table_and_once_in_status(self):
+        text, banner_text = self.forced_exit()
+        table, _, rest = text.partition("</w:tbl>")
+        title = renderer.banner_title("forced_exit_on_v3_with_remaining_issues", [])
+        self.assertEqual(1, table.count(escape(title)), "the title alone, not a fallbacks row repeating it")
+        self.assertNotIn(escape(banner_text), table)
+        self.assertNotIn(escape(i18n.t("en", "memo.banner_titles.fallbacks_heading")), table, "no list left")
+        self.assertEqual(1, rest.count(escape(title)))
+        self.assertEqual(1, rest.count(escape(banner_text)))
+        status = rest.partition(f"<w:t>{STATUS_LABEL}</w:t>")[2]
+        self.assertIn(escape(banner_text), status)
+
+    def test_neither_the_table_nor_status_points_at_the_appendix(self):
+        text, banner_text = self.forced_exit()
+        self.assertIn("the Status section", banner_text)
+        self.assertNotIn("appendix", text.lower())
+
+    def test_another_banner_stays_in_the_fallbacks_list(self):
+        other = fallbacks.banner("lint_not_converged")
+        text, banner_text = self.forced_exit((other,))
+        table = text.partition("</w:tbl>")[0]
+        self.assertIn(escape(f"- {other['text']}"), table)
+        self.assertNotIn(escape(banner_text), table)
+
+
+class AppendixLabelTest(GoldenCase):
+    """D-216: the group label is printed only when the appendix holds more than one group."""
+
+    def appendix(self, draft: str) -> str:
+        index = sample_index()
+        index.snapshot_ids.append("stale")
+        index.sources["stale"] = {"citation_form": "Some Circular 2011", "currency": {"status": "manual_check"}}
+        path = self.render(draft, index=index)
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        return text.partition(escape(APPENDIX_HEADING))[2]
+
+    def test_the_only_group_prints_no_label_under_the_heading(self):
+        appendix = self.appendix("Body [[src:stale]].\n")
+        self.assertIn("Some Circular 2011", appendix)
+        self.assertNotIn(escape(fallback.label("unverified_label")), appendix)
+
+    def test_two_groups_keep_both_labels(self):
+        appendix = self.appendix("Body [[src:stale]] and [[src:ghost]].\n")
+        self.assertIn(escape(fallback.label("unverified_label")), appendix)
+        self.assertIn(escape(fallback.label("unresolved_label")), appendix)
+
+
+class HtmlCommentTest(GoldenCase):
+    def test_section_anchors_are_dropped(self):
+        path = self.render("## 2. Analysis\n\n<!-- §s-2 -->\n\nBody.\n")
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        self.assertNotIn("s-2", text)
+        self.assertIn("2. Analysis", text)
+
+
+class StylesAndPartsTest(GoldenCase):
+    def test_the_footnote_styles_and_relationship_are_written(self):
+        path = self.render("Body [[src:gdpr]].\n")
+        with zipfile.ZipFile(path) as archive:
+            styles = archive.read("word/styles.xml").decode("utf-8")
+            rels = archive.read("word/_rels/document.xml.rels").decode("utf-8")
+            content_types = archive.read("[Content_Types].xml").decode("utf-8")
+        self.assertIn('w:styleId="FootnoteText"', styles)
+        self.assertIn('w:styleId="FootnoteReference"', styles)
+        self.assertIn("relationships/footnotes", rels)
+        self.assertIn("wordprocessingml.footnotes+xml", content_types)
+
+    def test_page_setup_is_one_inch_all_round(self):
+        path = self.render("Body.\n")
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        self.assertIn('w:bottom="1440"', text)
+        self.assertIn('w:left="1440"', text)
+        self.assertIn('w:right="1440"', text)
+        self.assertIn('w:top="1440"', text)
+
+
+class MergedSourceTest(GoldenCase):
+    """D-144: an alias the freeze collapsed (`merged_into`, D-143) is the canonical source.
+
+    Keyed by the raw id both mentions were a *first* mention: two full OSCOLA forms, two entries in
+    §Sources and two `first_n` for one source.
+    """
+
+    DRAFT = "Lawful under [[src:gdpr-copy art 6(1)(f)]], and again [[src:gdpr art 7]].\n"
+
+    def merged_index(self) -> fallback.SourceIndex:
+        base = sample_index()
+        return fallback.SourceIndex(
+            snapshot_ids=base.snapshot_ids,
+            entries=base.entries,
+            sources=dict(base.sources, **{"gdpr-copy": {"citation_form": "GDPR (consolidated)"}}),
+            quotes={"q-001": {"source_id": "gdpr-copy"}},
+            merged={"gdpr-copy": "gdpr"},
+            frozen=True,
+        )
+
+    def test_the_alias_is_the_first_mention_and_the_canonical_its_short_form(self):
+        self.render(self.DRAFT, index=self.merged_index())
+        self.assertEqual([], self.result["unresolved"])
+        self.assertEqual(
+            [(1, "gdpr", "full", 1), (2, "gdpr", "short", 1)],
+            [(row["n"], row["source_id"], row["form"], row["first_n"])
+             for row in self.result["footnotes"]],
+        )
+        self.assertIn("(n 1)", self.result["footnotes"][1]["text"])
+
+    def test_the_full_form_is_built_from_the_entry_of_the_canonical_id(self):
+        self.render(self.DRAFT, index=self.merged_index())
+        self.assertIn("Regulation (EU) 2016/679", self.result["footnotes"][0]["text"])
+        self.assertNotIn("consolidated", self.result["footnotes"][0]["text"])
+
+    def test_the_sources_section_lists_the_merged_source_once(self):
+        path = self.render(self.DRAFT, index=self.merged_index())
+        self.assertEqual(["gdpr"], self.result["cited"])
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        self.assertNotIn("consolidated", text)
+
+    def test_a_quote_on_an_alias_shares_the_number_of_the_canonical(self):
+        self.render("Rule [[src:gdpr]].\n\n> Text. [[q:q-001]]\n", index=self.merged_index())
+        self.assertEqual([], self.result["unresolved"])
+        # D-152: the attribution under a quotation stands on its own — a short form, never `ibid`.
+        self.assertEqual(
+            [(1, "full", 1), (2, "short", 1)],
+            [(row["n"], row["form"], row["first_n"]) for row in self.result["footnotes"]],
+        )
+        self.assertIn("(n 1)", self.result["footnotes"][1]["text"])
+
+
+class CitationStyleTest(GoldenCase):
+    """D-150: one golden per citation style over the same draft — footnotes and inline links."""
+
+    DRAFT = (
+        "## 1. Lawful basis\n\n"
+        "The basis is legitimate interests [[src:gdpr art 6(1)(f)]], not contract necessity.\n\n"
+        "> The transfer must be essentially equivalent. [[q:q-001]]\n\n"
+        "Transfers follow the case [[src:schrems para 168]] and the guidance [[src:edpb para 44]]; "
+        "the guidance is the operative one [[src:edpb para 44]].\n\n"
+        "Later again [[src:gdpr art 7]].\n\n"
+        "<!-- sources: generated -->\n"
+    )
+
+    def document(self, path: Path) -> str:
+        with zipfile.ZipFile(path) as archive:
+            return normalise(archive.read(DOCUMENT_PART))
+
+    def relationships(self, path: Path) -> str:
+        with zipfile.ZipFile(path) as archive:
+            return archive.read("word/_rels/document.xml.rels").decode("utf-8")
+
+    def test_the_footnote_style_golden(self):
+        self.assertGolden(
+            "citation_footnotes", self.render(self.DRAFT, citation_style=oscola.STYLE_FOOTNOTES)
+        )
+
+    def test_the_inline_style_golden(self):
+        self.assertGolden(
+            "citation_inline", self.render(self.DRAFT, citation_style=oscola.STYLE_INLINE)
+        )
+
+    def test_the_inline_style_writes_citations_instead_of_footnotes(self):
+        text = self.document(self.render(self.DRAFT, citation_style=oscola.STYLE_INLINE))
+        self.assertNotIn("footnoteReference", text)
+        self.assertEqual([], self.result["footnotes"])
+        self.assertIn(">Regulation (EU) 2016/679 (GDPR), art 6(1)(f)</w:t>", text)
+        self.assertIn(">Schrems II, para 168</w:t>", text)
+
+    def test_every_inline_citation_is_a_hyperlink_whose_relationship_resolves(self):
+        path = self.render(self.DRAFT, citation_style=oscola.STYLE_INLINE)
+        text = self.document(path)
+        rels = self.relationships(path)
+        used = sorted(set(re.findall(r'<w:hyperlink r:id="([^"]+)"', text)))
+        self.assertTrue(used, "the inline style links every citation")
+        for identifier in used:
+            self.assertIn(f'Id="{identifier}"', rels)
+        self.assertTrue(
+            validate.validate_path(path, footnotes_map=renderer.footnotes_map(self.result))["valid"]
+        )
+
+    def test_the_second_of_two_identical_adjacent_citations_is_dropped_inline(self):
+        text = self.document(self.render(self.DRAFT, citation_style=oscola.STYLE_INLINE))
+        self.assertEqual(1, text.count("Guidelines 05/2020 (4 May 2020) para 44"))
+        # the space that carried the dropped citation goes with it, so the sentence still ends `one.`
+        self.assertIn("the guidance is the operative one.</w:t>", text)
+
+    def test_the_second_of_two_identical_adjacent_citations_is_ibid_in_footnotes(self):
+        self.render(self.DRAFT, citation_style=oscola.STYLE_FOOTNOTES)
+        texts = [row["text"] for row in self.result["footnotes"]]
+        self.assertIn(i18n.t('en', 'memo.citation.ibid'), texts)
+
+    def test_the_footnote_style_keeps_the_footnotes_and_links_nothing(self):
+        path = self.render(self.DRAFT, citation_style=oscola.STYLE_FOOTNOTES)
+        text = self.document(path)
+        self.assertIn("footnoteReference", text)
+        self.assertNotIn("<w:hyperlink", text)
+
+    def test_both_styles_carry_the_same_sources_annex(self):
+        inline = self.document(self.render(self.DRAFT, citation_style=oscola.STYLE_INLINE))
+        footnotes = self.document(self.render(self.DRAFT, citation_style=oscola.STYLE_FOOTNOTES))
+        for text in (inline, footnotes):
+            self.assertIn("CELEX 32016R0679", text)
+            # D-197 (fix round 1): no source of this fixture was link-checked, so the annex states
+            # the currency and no retrieval date — in both styles alike, which is the point here.
+            self.assertIn("currency ok", text)
+            self.assertNotIn("checked 2026-09-01", text)
+        self.assertNotIn("CELEX", inline.split("<w:t>Sources</w:t>")[0])
+
+
+class LinkLessSourceTest(GoldenCase):
+    """D-192: a source with no public url gets no `w:hyperlink` and no URL in the annex."""
+
+    DRAFT = "Так решил суд [[src:vs-rf]].\n\n<!-- sources: generated -->\n"
+
+    def document(self, record: dict) -> str:
+        path = self.render(
+            self.DRAFT,
+            index=fallback.SourceIndex(sources={"vs-rf": dict(record)}),
+            citation_style=oscola.STYLE_INLINE,
+        )
+        with zipfile.ZipFile(path) as archive:
+            return normalise(archive.read(DOCUMENT_PART))
+
+    def test_the_inline_citation_carries_no_hyperlink_and_the_annex_names_the_database(self):
+        text = self.document(LINK_LESS_RECORD)
+        self.assertNotIn("<w:hyperlink", text)
+        self.assertIn("text retrieved from CasusLegal (RU)", text)
+        self.assertNotIn("mcp.casus.legal", text)
+        self.assertTrue(
+            validate.validate_path(
+                self.render(
+                    self.DRAFT,
+                    index=fallback.SourceIndex(sources={"vs-rf": dict(LINK_LESS_RECORD)}),
+                    citation_style=oscola.STYLE_INLINE,
+                ),
+                footnotes_map=renderer.footnotes_map(self.result),
+            )["valid"]
+        )
+
+    def test_an_old_record_carrying_an_endpoint_url_is_never_linked(self):
+        record = dict(LINK_LESS_RECORD, url=CASUS_ENDPOINT)
+        record.pop("retrieved_from")
+        text = self.document(record)
+        self.assertNotIn("<w:hyperlink", text)
+        self.assertNotIn("mcp.casus.legal", text)
+
+
+class SectionBoundaryTest(GoldenCase):
+    """D-152: the docx keeps the attribution of a quotation that opens a new section."""
+
+    DRAFT = (
+        "## 1. First\n\n"
+        "Claim [[src:gdpr art 6(1)(b)]].\n\n"
+        "## 2. Second\n\n"
+        "> [[q:q-001]] Essentially equivalent protection.\n"
+    )
+
+    def document(self, style: str) -> str:
+        path = self.render(self.DRAFT, citation_style=style)
+        with zipfile.ZipFile(path) as archive:
+            return normalise(archive.read(DOCUMENT_PART))
+
+    def test_the_inline_style_keeps_the_attribution_line(self):
+        """The quotation is the first mention of its own source, so it carries the full form."""
+        text = self.document(oscola.STYLE_INLINE)
+        self.assertIn(escape(fallback.ATTRIBUTION_PREFIX), text)
+        self.assertIn(">Case C-311/18 ", text)
+
+    def test_the_footnote_style_writes_a_short_form_not_an_ibid(self):
+        self.render(self.DRAFT, citation_style=oscola.STYLE_FOOTNOTES)
+        forms = [(row["n"], row["form"]) for row in self.result["footnotes"]]
+        self.assertEqual([(1, "full"), (2, "full")], forms)
+
+    def test_a_quotation_of_a_source_already_cited_is_a_short_form(self):
+        draft = (
+            "## 1. First\n\nClaim [[src:schrems para 168]].\n\n"
+            "## 2. Second\n\n> [[q:q-001]] Essentially equivalent protection.\n"
+        )
+        self.render(draft, citation_style=oscola.STYLE_FOOTNOTES)
+        self.assertEqual(
+            [(1, "full"), (2, "short")],
+            [(row["n"], row["form"]) for row in self.result["footnotes"]],
+        )
+        self.assertIn("(n 1)", self.result["footnotes"][1]["text"])
+
+    def test_the_inline_style_of_that_quotation_still_carries_its_citation(self):
+        draft = (
+            "## 1. First\n\nClaim [[src:schrems para 168]].\n\n"
+            "## 2. Second\n\n> [[q:q-001]] Essentially equivalent protection.\n"
+        )
+        path = self.render(draft, citation_style=oscola.STYLE_INLINE)
+        with zipfile.ZipFile(path) as archive:
+            text = normalise(archive.read(DOCUMENT_PART))
+        attribution = text.split("Essentially equivalent protection.")[1]
+        self.assertIn(escape(fallback.ATTRIBUTION_PREFIX), attribution)
+        self.assertIn(">Schrems II</w:t>", attribution)
+
+
+class FootnotesMapTest(GoldenCase):
+    def test_the_map_carries_every_resolved_mention(self):
+        self.render(FootnoteTest.REPEAT)
+        payload = renderer.footnotes_map(self.result)
+        self.assertEqual([1, 2, 3], [row["n"] for row in payload["footnotes"]])
+        self.assertEqual(["gdpr", "schrems"], payload["cited"])
+        self.assertEqual([], payload["unresolved"])
+
+
+class RenderErrorTest(unittest.TestCase):
+    def test_a_render_failure_becomes_a_render_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "nested" / "memo.docx"
+            with self.assertRaises(renderer.RenderError):
+                renderer.render("Body.\n", "not an index", target)
+
+    def test_unresolved_text_is_the_marker_the_fallback_uses(self):
+        self.assertEqual("[unresolved: x]", oscola.unresolved_text("x"))
+
+
+class _ExportCommandCase(unittest.TestCase):
+    """A work dir in the export phase plus the `mf docx render` call over it; no cases of its own."""
+
+    def make_task(self, language: str = "en") -> Path:
+        from memoforge import state_io, task
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        work_dir = Path(tmp.name) / "memo-20260908T120000Z-gdpr"
+        task.create_work_dir_tree(work_dir)
+        state = task.build_initial_state(
+            task_id=work_dir.name,
+            user_query="q",
+            language=language,
+            work_dir=work_dir,
+            output_folder=work_dir.parent,
+            config={},
+        )
+        state["current_phase"] = "export"
+        state["current_draft_path"] = "drafts/v1.md"
+        (work_dir / "drafts" / "v1.md").write_text("Body.\n", encoding="utf-8")
+        state_io.create_state(work_dir, state)
+        return work_dir
+
+    def run_render(self, work_dir: Path) -> dict:
+        import argparse
+
+        from memoforge import docx
+
+        issue_step(work_dir, "s-render")
+        return docx.run_render(
+            argparse.Namespace(
+                workdir=str(work_dir), step="s-render", attempt=1, draft_sha=None, human=False
+            )
+        )
+
+
+class FallbackBranchTest(_ExportCommandCase):
+    """§5.5/§5.6: a renderer failure or a missing dependency degrades `docx render` to markdown."""
+
+    def test_a_renderer_exception_falls_back_to_markdown(self):
+        from unittest import mock
+
+        from memoforge import state_io
+
+        work_dir = self.make_task()
+        with mock.patch.object(renderer, "render_workdir", side_effect=renderer.RenderError("boom")):
+            result = self.run_render(work_dir)
+        self.assertEqual("md_fallback", result["renderer"])
+        self.assertEqual("memo-gdpr.md", result["deliverable_path"])
+        self.assertIsNone(result["docx"])
+        self.assertIn("RenderError: boom", result["render_error"])
+        self.assertFalse((work_dir / "memo-gdpr.docx").exists())
+        state = state_io.read_state(work_dir)
+        self.assertIn("docx_export_failed", [row["banner_id"] for row in state["fallback_banners"]])
+        self.assertIsNone(state["final_docx_path"])
+
+    def test_a_missing_dependency_falls_back_to_markdown(self):
+        """Without `python-docx`/`mistune` the `from . import renderer` inside the command fails."""
+        from memoforge import docx as docx_package
+
+        work_dir = self.make_task()
+        module = sys.modules["memoforge.docx.renderer"]
+        sys.modules["memoforge.docx.renderer"] = None
+        delattr(docx_package, "renderer")
+        try:
+            result = self.run_render(work_dir)
+        finally:
+            sys.modules["memoforge.docx.renderer"] = module
+            docx_package.renderer = module
+        self.assertEqual("md_fallback", result["renderer"])
+        self.assertTrue(result["render_error"].startswith("ImportError"))
+        self.assertTrue((work_dir / "memo-gdpr.md").is_file())
+        self.assertFalse((work_dir / "memo-gdpr.docx").exists())
+
+    def test_the_docx_branch_writes_both_deliverables(self):
+        work_dir = self.make_task()
+        result = self.run_render(work_dir)
+        self.assertEqual("docx", result["renderer"])
+        self.assertEqual("memo-gdpr.docx", result["deliverable_path"])
+        self.assertEqual("memo-gdpr.md", result["markdown_path"])
+        self.assertTrue((work_dir / "memo-gdpr.docx").is_file())
+        self.assertTrue((work_dir / "memo-gdpr.md").is_file())
+
+
+class UnreadablePackRenderTest(_ExportCommandCase):
+    """D-181: an unreadable memo pack is a business error of `docx render`, not an `internal_error`.
+
+    `fallback.render_workdir` raises `i18n.PackUnavailable`, which `cli.error_result` turns into
+    `internal_error: PackUnavailable: …` plus a traceback. The command answers the documented
+    `language_pack_unavailable: <code>` instead — the shape `finalize.run_finalize` already uses —
+    and writes nothing, so the run takes its ordinary `docx_export_failed` route.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.packs = Path(tmp.name)
+        patcher = mock.patch.object(i18n, "PACK_DIR", self.packs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        i18n._cache.clear()
+        self.addCleanup(i18n._cache.clear)
+        (self.packs / "ru.json").write_text("{not json", encoding="utf-8")
+
+    def test_an_unreadable_pack_is_a_business_error_and_nothing_is_written(self):
+        work_dir = self.make_task(language="ru")
+        result = self.run_render(work_dir)
+        self.assertEqual(["language_pack_unavailable: ru"], result["errors"])
+        self.assertFalse((work_dir / "memo-gdpr.md").exists())
+        self.assertFalse((work_dir / "memo-gdpr.docx").exists())
+        self.assertFalse((work_dir / "memo-gdpr.invalid.docx").exists())
+
+        # Second step: the answer is about the pack and about nothing else. The step was left open
+        # and no file of it was written, so a readable pack renders the very same work dir.
+        _i18n.fake_pack(self.packs, "ru", RU_DELIVERABLE)
+        i18n._cache.clear()
+        repaired = self.run_render(work_dir)
+        self.assertNotIn("errors", repaired)
+        self.assertEqual("docx", repaired["renderer"])
+        self.assertTrue((work_dir / "memo-gdpr.docx").is_file())
+
+
+class LocalizedDocxTest(GoldenCase):
+    """D-175: the docx prints its labels in the memo language and declares it to Word."""
+
+    DRAFT = "Правомерно по [[src:gdpr art 6(1)(f)]].\n"
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.packs = Path(tmp.name)
+        patcher = mock.patch.object(i18n, "PACK_DIR", self.packs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        _i18n.fake_pack(self.packs, "ru", dict(RU_DELIVERABLE, **{"memo.docx_lang": "ru-RU"}))
+
+    def part(self, name: str, draft: str | None = None, **kwargs) -> str:
+        path = self.render(draft or self.DRAFT, **kwargs)
+        with zipfile.ZipFile(path) as archive:
+            return archive.read(name).decode("utf-8")
+
+    def test_the_docx_declares_the_memo_language(self):
+        self.assertIn('<w:lang w:val="ru-RU"', self.part(STYLES_PART, language="ru"))
+
+    def test_english_keeps_the_declaration_the_template_ships(self):
+        self.assertEqual(self.part(STYLES_PART, language="en"), self.part(STYLES_PART))
+        self.assertIn('<w:lang w:val="en-US"', self.part(STYLES_PART))
+
+    def test_the_generated_sections_are_localized(self):
+        # D-191: an unresolved marker opens the appendix; warnings alone would not.
+        text = normalise(
+            self.part(
+                DOCUMENT_PART,
+                draft="Правомерно по [[src:gdpr art 6(1)(f)]].\n\nПризрак [[src:ghost]].\n",
+                language="ru",
+                drafting_warnings=["Одно допущение."],
+                final_status="forced_exit_on_v1",
+                remaining_blocking_issues=[{"severity": "blocker", "issue": "Нет нормы."}],
+            ).encode("utf-8")
+        )
+        for key in ("sources_heading", "appendix_heading", "status_label"):
+            self.assertIn(escape(i18n.t("ru", f"memo.labels.{key}")), text, key)
+            self.assertNotIn(f"<w:t>{i18n.t('en', f'memo.labels.{key}')}</w:t>", text, key)
+        self.assertNotIn("Одно допущение.", text)
+
+    def test_the_banner_table_is_localized(self):
+        text = self.part(
+            DOCUMENT_PART,
+            language="ru",
+            final_status="forced_exit_on_v1",
+            banners=[{"banner_id": "forced_exit", "text": "Замечания остались."}],
+            final_status_reasons=["no_checked_draft"],
+        )
+        self.assertIn("ЗАМЕЧАНИЯ РЕЦЕНЗЕНТОВ СНЯТЫ НЕ ПОЛНОСТЬЮ", text)
+        self.assertIn("Перед использованием требуется ручная проверка. Итоговый статус:", text)
+        self.assertIn("Сработавшие запасные сценарии:", text)
+        self.assertIn("Причины, записанные для ручной проверки:", text)
+        self.assertNotIn("REVIEWER NOTES NOT FULLY RESOLVED", text)
+
+    def test_the_banner_title_follows_the_pack(self):
+        self.assertEqual(
+            "ЗАМЕЧАНИЯ РЕЦЕНЗЕНТОВ СНЯТЫ НЕ ПОЛНОСТЬЮ",
+            renderer.banner_title("forced_exit_on_v2", [], language="ru"),
+        )
+        self.assertEqual(
+            "REVIEWER NOTES NOT FULLY RESOLVED", renderer.banner_title("forced_exit_on_v2", [])
+        )
+
+    def test_the_footnote_carries_the_localized_pinpoint(self):
+        text = self.part(DOCUMENT_PART, language="ru", citation_style=oscola.STYLE_FOOTNOTES)
+        notes = self.part(FOOTNOTES_PART, language="ru", citation_style=oscola.STYLE_FOOTNOTES)
+        self.assertIn("ст. 6(1)(f)", notes)
+        self.assertNotIn("art 6(1)(f)", notes)
+        self.assertIn('<w:footnoteReference w:id="1"/>', normalise(text.encode("utf-8")))
+
+
+CLASSICAL_DRAFT = Path(__file__).resolve().parent / "fixtures" / "drafts" / "classical-clean.md"
+
+BRIEF_TITLE = "DECISION BRIEF — CHECK BEFORE USE"
+BRIEF_BANNERS = [{"banner_id": "brief_unverified", "text": "Fidelity check BF-02 not closed."}]
+
+
+def classical_index() -> fallback.SourceIndex:
+    """The three ids `classical-clean.md` cites, each registered with a public url."""
+    return fallback.SourceIndex(
+        sources={
+            "gdpr-art-6": {"citation_form": "Regulation (EU) 2016/679, art 6", "url": "https://eur-lex.europa.eu/6"},
+            "gdpr-art-7": {"citation_form": "Regulation (EU) 2016/679, art 7", "url": "https://eur-lex.europa.eu/7"},
+        },
+        quotes={"q-gdpr-art-6-1": {"source_id": "gdpr-art-6"}},
+    )
+
+
+def unverified_index() -> fallback.SourceIndex:
+    """`sample_index` plus one cited source whose currency sends it to the appendix."""
+    index = sample_index()
+    index.snapshot_ids.append("stale")
+    index.sources["stale"] = {
+        "citation_form": "Some Circular 2011",
+        "url": "https://example.org/circular-2011",
+        "currency": {"status": "manual_check"},
+    }
+    return index
+
+
+class RendererSwitchesTest(GoldenCase):
+    """D-221: `sources`, `appendix`, `banner_title` and `banner_subtitle` of the decision brief."""
+
+    UNVERIFIED_DRAFT = (
+        "## 1. Bottom line\n\nThe circular applies [[src:stale para 3]].\n\n<!-- sources: generated -->\n"
+    )
+
+    def document(self, path: Path) -> str:
+        with zipfile.ZipFile(path) as archive:
+            return normalise(archive.read(DOCUMENT_PART))
+
+    def valid(self, path: Path) -> dict:
+        return validate.validate_path(path, footnotes_map=renderer.footnotes_map(self.result))
+
+    def test_the_defaults_render_the_bytes_of_today(self):
+        draft = CLASSICAL_DRAFT.read_text(encoding="utf-8")
+        for style in (oscola.STYLE_FOOTNOTES, oscola.STYLE_INLINE):
+            with self.subTest(style=style):
+                plain = self.render(draft, index=classical_index(), citation_style=style)
+                switched = self.render(
+                    draft,
+                    index=classical_index(),
+                    citation_style=style,
+                    sources=True,
+                    appendix=True,
+                    banner_title=None,
+                    banner_subtitle=None,
+                )
+                with zipfile.ZipFile(plain) as one, zipfile.ZipFile(switched) as two:
+                    self.assertEqual(one.read(DOCUMENT_PART), two.read(DOCUMENT_PART))
+                    self.assertEqual(one.read(FOOTNOTES_PART), two.read(FOOTNOTES_PART))
+
+    def test_the_fixture_opens_both_parts_by_default(self):
+        path = self.render(self.UNVERIFIED_DRAFT, index=unverified_index(), citation_style=oscola.STYLE_INLINE)
+        text = self.document(path)
+        self.assertIn(escape(fallback.label("sources_heading")), text)
+        self.assertIn(escape(APPENDIX_HEADING), text)
+
+    def test_sources_and_appendix_left_out(self):
+        path = self.render(
+            self.UNVERIFIED_DRAFT,
+            index=unverified_index(),
+            citation_style=oscola.STYLE_INLINE,
+            sources=False,
+            appendix=False,
+        )
+        text = self.document(path)
+        self.assertNotIn(escape(fallback.label("sources_heading")), text)
+        self.assertNotIn(escape(APPENDIX_HEADING), text)
+        self.assertNotIn("sources: generated", text)
+        self.assertIn("<w:hyperlink", text)
+        self.assertIn("Some Circular 2011", text, "the inline citation stays in the body")
+        self.assertTrue(self.valid(path)["valid"], self.valid(path))
+
+    def test_the_brief_banner_carries_its_own_title_and_no_fallbacks_heading(self):
+        path = self.render(
+            "Body of the brief.\n",
+            citation_style=oscola.STYLE_INLINE,
+            banners=BRIEF_BANNERS,
+            banner_title=BRIEF_TITLE,
+            banner_subtitle="Sub",
+            sources=False,
+            appendix=False,
+        )
+        table = self.document(path).partition("</w:tbl>")[0]
+        self.assertIn(escape(BRIEF_TITLE), table)
+        self.assertIn("<w:t>Sub</w:t>", table)
+        self.assertIn(escape("- Fidelity check BF-02 not closed."), table)
+        self.assertNotIn("Pipeline fallbacks that fired during this run:", table)
+        self.assertNotIn(escape(i18n.t("en", "memo.banner_titles.fallbacks_heading")), table)
+        self.assertNotIn(escape(i18n.t("en", "memo.banner_titles.reasons_heading")), table)
+        self.assertNotIn(escape(i18n.t("en", "memo.banner_titles.subtitle")), table)
+        self.assertEqual(["brief_unverified"], [row["banner_id"] for row in self.result["banners"]])
+
+    def test_a_banner_opening_with_the_brief_title_is_still_listed(self):
+        banners = [{"banner_id": "brief_too_long", "text": f"{BRIEF_TITLE}: this brief is longer than three pages."}]
+        path = self.render(
+            "Body of the brief.\n",
+            citation_style=oscola.STYLE_INLINE,
+            banners=banners,
+            banner_title=BRIEF_TITLE,
+            banner_subtitle="Sub",
+        )
+        table = self.document(path).partition("</w:tbl>")[0]
+        self.assertIn(escape(f"- {BRIEF_TITLE}: this brief is longer than three pages."), table)
+
+    def test_an_empty_brief_title_is_no_title(self):
+        def table(**kwargs) -> bytes:
+            path = self.render(
+                "Body of the brief.\n", citation_style=oscola.STYLE_INLINE, banners=BRIEF_BANNERS, **kwargs
+            )
+            with zipfile.ZipFile(path) as archive:
+                return archive.read(DOCUMENT_PART)
+
+        empty = table(banner_title="", banner_subtitle="Sub")
+        self.assertEqual(table(), empty)
+        self.assertIn(escape(i18n.t("en", "memo.banner_titles.fallbacks_heading")), normalise(empty))
+
+    def test_without_banners_the_brief_title_draws_nothing(self):
+        text = self.document(
+            self.render("Body of the brief.\n", citation_style=oscola.STYLE_INLINE, banner_title=BRIEF_TITLE)
+        )
+        self.assertNotIn(escape(BRIEF_TITLE), text)
+        self.assertNotIn("FFF3CD", text)
+
+    def test_a_brief_without_any_token_validates(self):
+        path = self.render(
+            "## 1. Bottom line\n\nNo citation at all.\n",
+            citation_style=oscola.STYLE_INLINE,
+            sources=False,
+            appendix=False,
+        )
+        report = self.valid(path)
+        self.assertTrue(report["valid"], report)
+        self.assertNotIn(validate.E_COUNT_MISMATCH, report["errors"])
+        self.assertEqual(0, report["footnotes"])
+
+    def test_a_brief_whose_only_token_repeats_validates(self):
+        draft = "The rule [[src:gdpr art 6]] and again [[src:gdpr art 6]].\n"
+        mentions = fallback.scan_mentions(draft, sample_index(), oscola.STYLE_INLINE)["mentions"]
+        self.assertEqual(oscola.FORM_OMITTED, mentions[1].get("form"), "the repeat is an omitted mention")
+        path = self.render(draft, citation_style=oscola.STYLE_INLINE, sources=False, appendix=False)
+        report = self.valid(path)
+        self.assertTrue(report["valid"], report)
+
+
+if __name__ == "__main__":
+    unittest.main()

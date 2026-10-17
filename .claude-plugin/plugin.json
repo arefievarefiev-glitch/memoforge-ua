@@ -1,0 +1,82 @@
+{
+  "name": "memoforge",
+  "displayName": "memoforge UA (fork for Ukrainian law)",
+  "version": "2.0.0",
+  "description": "Multi-agent legal opinion drafting adapted for Ukrainian law: intake questions, planned legal research through Legal Data Hunter (Verkhovna Rada legislation, Supreme Court and Constitutional Court practice), a frozen source pack with verifiable quotes, a counterargument and citation review loop, and a footnoted docx deliverable in Ukrainian. Fork of memoforge by Grigorii Moskalev (MIT).",
+  "author": {
+    "name": "Grigorii Moskalev"
+  },
+  "homepage": "https://github.com/gregmos/memoforge#readme",
+  "repository": "https://github.com/gregmos/memoforge",
+  "license": "MIT",
+  "keywords": [
+    "ukraine",
+    "legal",
+    "memo",
+    "legal-research",
+    "gdpr",
+    "compliance",
+    "docx",
+    "multi-agent"
+  ],
+  "userConfig": {
+    "output_folder": {
+      "title": "Output folder",
+      "type": "directory",
+      "description": "Where task folders are created. Default: ~/Documents/memoforge, then ./outputs/memoforge-work."
+    },
+    "publish_folder": {
+      "title": "Publish folder",
+      "type": "directory",
+      "description": "Where the finished result is copied: deliverable, summary and the frozen source texts. Default: the host's outputs area when one exists (Cowork `/mnt/user-data/outputs`), else nothing is copied."
+    },
+    "writer_model": {
+      "title": "Writer model",
+      "type": "string",
+      "default": "opus",
+      "description": "Model for memo-writer: opus, fable or sonnet. An unknown value falls back to opus."
+    },
+    "source_review_gate": {
+      "title": "Source-pack review gate",
+      "type": "string",
+      "default": "auto",
+      "description": "Show the source-pack review gate: auto (mode decides), on (always) or off (never)."
+    },
+    "citation_style": {
+      "title": "Citation style",
+      "type": "string",
+      "default": "inline",
+      "description": "How citations appear in the memorandum: inline (short parenthetical citations linked to the source, full records in the Sources annex) or footnotes (a Word footnote per citation)."
+    },
+    "memo_language": {
+      "title": "Memo language",
+      "type": "string",
+      "default": "uk",
+      "description": "Language of the memorandum, summary and docx: en, de, fr, es, ru, uk, or auto (use the detected language of the request)."
+    },
+    "ui_language": {
+      "title": "Interface language",
+      "type": "string",
+      "default": "auto",
+      "description": "Language of the plugin interface (gates, dashboard): en, de, fr, es, ru, uk, or auto (use the detected language of the request)."
+    },
+    "dashboard": {
+      "title": "Live dashboard",
+      "type": "boolean",
+      "default": true,
+      "description": "Publish a live Artifact dashboard for the run (one extra tool call per step). Turn off to save calls; if the host has no Artifact tool the run continues without it."
+    },
+    "stop_guard": {
+      "title": "Stop guard",
+      "type": "boolean",
+      "default": false,
+      "description": "Block the end of a turn while a task is mid-phase, at most twice per phase."
+    },
+    "websearch_autoallow": {
+      "title": "Auto-allow WebSearch",
+      "type": "boolean",
+      "default": true,
+      "description": "Auto-approve WebSearch while a memoforge task is active."
+    }
+  }
+}

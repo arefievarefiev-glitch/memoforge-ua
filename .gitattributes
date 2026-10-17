@@ -1,0 +1,29 @@
+# Windows-first repository hygiene (ТЗ §5.6, M12).
+* text=auto
+
+*.py text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+
+# Binary fixtures: never touched by the line-ending policy above. A PDF without a NUL byte
+# in its first 8000 (a small one-page file is easily such) is detected as TEXT by `text=auto`,
+# and a checkout with core.autocrlf=true then rewrites its bytes and its digest.
+*.pdf binary
+*.docx binary
+*.png binary
+
+# cmd.exe needs CRLF batch files.
+*.cmd text eol=crlf
+
+# Extensionless POSIX launcher.
+scripts/mf text eol=lf
+
+# Real portal captures (plan 68): served to the tests byte for byte, so no line-ending policy
+# may touch them — an HTML page falls under `text=auto` above and a Windows checkout would
+# rewrite it. Last in the file so it overrides the per-extension rules for these folders.
+scripts/tests/fixtures/vsrf/** binary
+scripts/tests/fixtures/sudact/** binary

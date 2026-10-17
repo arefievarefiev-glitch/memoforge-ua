@@ -1,0 +1,5312 @@
+"""Tests for scripts/memoforge/machine.py — the `next`/`report` protocol (ТЗ §2.1, §2.4, §3.1, §9)."""
+
+from __future__ import annotations
+
+import copy
+import json
+import re
+import sys
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+from unittest import mock
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[2]
+if str(PLUGIN_ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _pipeline import Driver, namespace, temp_root  # noqa: E402
+import _i18n  # noqa: E402
+from memoforge import docx as docx_export  # noqa: E402
+from memoforge import (  # noqa: E402
+    events,
+    gates,
+    limits,
+    machine,
+    modes,
+    phases,
+    preflight,
+    probe,
+    review,
+    schema,
+    sources,
+    state_io,
+    stepctx,
+)
+from memoforge.docx import fallback as md_fallback  # noqa: E402
+
+
+def _published_shas(state: dict) -> dict:
+    """`published[]` reduced to «path -> sha»: the part a replay must leave untouched (§2.2)."""
+    return {row["canonical_path"]: row["sha256"] for row in state.get("published") or []}
+
+
+def _agent_done(driver: Driver, action: dict, slot: str) -> None:
+    """`mf agent log --state done` for one slot: the completion marker the checks of §3.1 read."""
+    machine.run_agent_log(
+        namespace(
+            workdir=str(driver.work_dir),
+            step=action["step_id"],
+            attempt=action["attempt"],
+            slot=slot,
+            state="done",
+            detail=None,
+            mcp=None,
+        )
+    )
+
+
+BREAK_RISK = ("Risk: medium. The exposure", "Risk: unclear. The exposure")
+"""An L-07 blocker (D-12/D-22): the Risk line of the analytical subsection loses its literal form."""
+
+
+def _act_writer(driver: Driver, action: dict, *, edit: tuple[str, str] | None = None) -> dict:
+    """Run the fixture writer, optionally edit the produced draft, then report the slot."""
+    agent = action["agents"][0]
+    step = {"step_id": action["step_id"], "attempt": action["attempt"]}
+    probe.run_fixture_agent(driver.work_dir, driver.state(), step, agent)
+    if edit is not None:
+        target = driver.work_dir / agent["expected_outputs"][0]["work_path"]
+        text = target.read_text(encoding="utf-8-sig").replace(edit[0], edit[1], 1)
+        target.write_bytes(text.encode("utf-8"))
+        _agent_done(driver, action, agent["slot"])
+    return driver.report(action["step_id"], action["attempt"], agent=agent["slot"])
+
+
+def _drive_to_script(driver: Driver, key: str, *, limit: int = 60, act: bool = True) -> dict:
+    """Advance the run until `next` issues the script step of `key`; act on it when asked."""
+    for _ in range(limit):
+        action = driver.next()
+        if action.get("errors"):
+            raise AssertionError(f"next failed: {action['errors']}")
+        if action["kind"] == "script" and machine.command_key(action["command"]) == key:
+            if act:
+                driver.act(action)
+            return action
+        driver.act(action)
+    raise AssertionError(f"the script step {key} was never issued")
+
+
+class PhaseTableTest(unittest.TestCase):
+    """§2.1: for every phase x mode, the kind of step `next` issues first."""
+
+    EXPECTED = {
+        "intake_preliminary_research": "inline-llm",
+        "intake_questions_pending": "gate-text",
+        "planning": "inline-llm",
+        "plan_approval_pending": "gate-auq",
+        "research": "dispatch",
+        "research_sufficiency": "dispatch",
+        "currency_check": "script",
+        "source_pack": "script",
+        "source_review_pending": "gate-text",
+        "drafting": "dispatch",
+        "revision_loop": "dispatch",
+        "client_readiness": "dispatch",
+        "export": "script",
+    }
+
+    def test_every_phase_issues_the_kind_of_step_the_table_names(self):
+        driver = Driver(temp_root(self), slug="table-full")
+        seen: dict[str, str] = {}
+        for _ in range(200):
+            action = driver.next()
+            self.assertNotIn("errors", action, action)
+            if action["kind"] == "terminal":
+                break
+            # D-57 puts `mf render <view>` in front of the consumer named by the table; the
+            # table describes the working step of the phase, so the views are not counted.
+            if not (
+                action["kind"] == "script"
+                and machine.command_key(action["command"]).startswith("render.")
+            ):
+                seen.setdefault(str(action["phase"]), str(action["kind"]))
+            driver.act(action)
+        for phase, kind in seen.items():
+            self.assertEqual(self.EXPECTED[phase], kind, f"{phase} issued {kind}")
+        self.assertIn("export", seen)
+        self.assertIn("source_review_pending", seen)
+
+    def test_sufficiency_outcomes_map_onto_phases(self):
+        # §2.1 row 6: the four `sufficiency route` outcomes and where each one goes.
+        self.assertEqual(
+            {
+                "currency_check": "currency_check",
+                "gate_followup": "research_sufficiency_followup_pending",
+                "research_subset": "research",
+                "insufficient_gate": "research_insufficient_pending",
+            },
+            machine.SUFFICIENCY_TARGETS,
+        )
+
+    def test_terminal_phase_returns_a_terminal_step(self):
+        driver = Driver(temp_root(self), slug="terminal")
+        action = driver.run_to_end()
+        self.assertEqual("terminal", action["kind"])
+        self.assertEqual("done", action["phase"])
+        self.assertIn("Summary:", action["text"])
+        again = driver.next()
+        self.assertEqual(action["step_id"], again["step_id"])
+
+    def test_the_terminal_text_names_the_published_folder_only_when_there_is_one(self):
+        """D-109: the `Published:` line is the folder the user opens, and it is skipped otherwise."""
+        driver = Driver(temp_root(self), slug="published")
+        action = driver.run_to_end()
+        state = driver.state()
+        if not machine.published_to(state):
+            self.assertNotIn("Published:", action["text"])
+
+        def mutator(current: dict) -> None:
+            current["progress"]["published_to"] = "/mnt/user-data/outputs/memoforge/published"
+
+        state_io.write_state(driver.work_dir, mutator)
+        text = machine.terminal_response(driver.work_dir, driver.state())["text"]
+        self.assertIn("Published: /mnt/user-data/outputs/memoforge/published", text)
+        self.assertLess(text.index("Summary:"), text.index("Published:"))
+        self.assertNotIn("Files:", text, "D-217: no `result_published` manifest, no count")
+
+    def test_the_terminal_text_prints_the_banners_the_way_the_deliverable_does(self):
+        """Final review: a resumed run-74 state still stores the old "appendix" wording (D-216)."""
+        driver = Driver(temp_root(self), slug="banners")
+        driver.run_to_end()
+        stored = _run_74("state-exit.json")["fallback_banners"]
+        self.assertIn("appendix", stored[0]["text"])
+        unchanged = {"banner_id": "unknown_banner", "text": "A banner nothing re-renders."}
+
+        def mutator(current: dict) -> None:
+            current["fallback_banners"] = copy.deepcopy(stored) + [unchanged, "A plain string banner."]
+
+        state_io.write_state(driver.work_dir, mutator)
+        text = machine.terminal_response(driver.work_dir, driver.state())["text"]
+        self.assertIn("Status section", text)
+        self.assertNotIn("appendix", text)
+        self.assertIn("- A banner nothing re-renders.", text.splitlines())
+        self.assertIn("- A plain string banner.", text.splitlines())
+
+    def test_the_terminal_text_names_the_memo_copy_only_when_there_is_one(self):
+        """D-167: the `Memo:` line is the root-level copy the router presents, skipped otherwise."""
+        driver = Driver(temp_root(self), slug="memo-line")
+        action = driver.run_to_end()
+        self.assertNotIn("Memo:", action["text"])
+
+        def mutator(current: dict) -> None:
+            current["progress"]["published_memo"] = "/mnt/user-data/outputs/memo-memo-line.md"
+
+        state_io.write_state(driver.work_dir, mutator)
+        text = machine.terminal_response(driver.work_dir, driver.state())["text"]
+        self.assertIn("Memo: /mnt/user-data/outputs/memo-memo-line.md", text)
+        lines = text.splitlines()
+        deliverable_idx = next(i for i, line in enumerate(lines) if line.startswith("Deliverable:"))
+        memo_idx = next(i for i, line in enumerate(lines) if line.startswith("Memo:"))
+        self.assertEqual(memo_idx, deliverable_idx + 1)
+
+
+class IdempotenceTest(unittest.TestCase):
+    """M3: `next` and `report` are idempotent (§3.1)."""
+
+    def test_idempotent_next_without_report(self):
+        driver = Driver(temp_root(self), slug="idem")
+        first = driver.next()
+        second = driver.next()
+        # An unfinished inline-llm step comes back unchanged: same id, same attempt, same phase.
+        self.assertEqual(first["step_id"], second["step_id"])
+        self.assertEqual(first["attempt"], second["attempt"])
+        self.assertEqual(first["phase"], second["phase"])
+        self.assertEqual(1, len({row["step_id"] for row in driver.state()["steps"]}))
+
+        gate = driver.run_until("intake_questions_pending")
+        repeat = driver.next()
+        self.assertEqual(gate["step_id"], repeat["step_id"])
+        self.assertEqual(gate["text"], repeat["text"])
+        self.assertEqual(gate["generation"], repeat["generation"])
+
+    def test_next_on_an_unclosed_dispatch_recovers_without_spending_budget(self):
+        # §3.1 rule 3: slots without a marker are re-issued with attempt+1 and `reason: recovery`.
+        driver = Driver(temp_root(self), slug="recover")
+        action = driver.run_until("research")
+        again = driver.next()
+        self.assertEqual(action["step_id"], again["step_id"])
+        self.assertEqual(action["attempt"] + 1, again["attempt"])
+        self.assertEqual("recovery", again["reason"])
+        self.assertEqual(0, driver.state()["attempts"]["research_dispatch_retry"])
+        self.assertEqual("research", driver.state()["current_phase"])
+
+    def test_report_is_noop_when_closed(self):
+        driver = Driver(temp_root(self), slug="noop")
+        action = driver.run_until("intake_preliminary_research")
+        driver.act(action)
+        answer = driver.report(action["step_id"], action["attempt"])
+        self.assertTrue(answer["accepted"])
+        self.assertTrue(answer["already_reported"])
+
+    def test_report_emits_agent_returned(self):
+        driver = Driver(temp_root(self), slug="returned")
+        action = driver.run_until("research")
+        driver.act(action)
+        records = [
+            row
+            for row in events.read_events(driver.work_dir)
+            if row["event"] == "agent_returned" and row["data"]["step_id"] == action["step_id"]
+        ]
+        self.assertEqual(3, len(records))
+        self.assertEqual({"statutes", "case_law", "doctrine"}, {r["data"]["slot"] for r in records})
+        self.assertTrue(all(isinstance(r["data"]["duration_seconds"], (int, float)) for r in records))
+
+    def test_report_clears_active_without_subagent_stop(self):
+        driver = Driver(temp_root(self), slug="active")
+        action = driver.run_until("research")
+        self.assertEqual(3, len(driver.state()["progress"]["active"]))
+        driver.report(action["step_id"], action["attempt"], agent="statutes", status="fail")
+        active = {row["slot"] for row in driver.state()["progress"]["active"]}
+        self.assertEqual({"case_law", "doctrine"}, active)
+
+
+class ProtocolRulesTest(unittest.TestCase):
+    """§3.1 rules 1, 2 and 6."""
+
+    def test_next_writes_step_issued(self):
+        driver = Driver(temp_root(self), slug="rules")
+        action = driver.next()
+        journal = events.read_events(driver.work_dir)
+        issued = [row for row in journal if row["event"] == "step_issued"]
+        self.assertEqual([action["step_id"]], [row["data"]["step_id"] for row in issued])
+        # D-43: `cli_call` belongs to `cli.main`; the handlers themselves emit nothing.
+        self.assertEqual([], [row for row in journal if row["event"] == "cli_call"])
+
+    def test_parallel_dispatch_is_marked_for_one_message(self):
+        driver = Driver(temp_root(self), slug="parallel")
+        research = driver.run_until("research")
+        self.assertTrue(research["parallel"])
+        self.assertEqual(3, len(research["agents"]))
+        driver.act(research)
+        reviewers = driver.run_until("revision_loop")
+        self.assertTrue(reviewers["parallel"])
+        self.assertEqual(4, len(reviewers["agents"]))
+
+    def test_single_slot_dispatch_is_not_parallel(self):
+        driver = Driver(temp_root(self), slug="serial")
+        action = driver.run_until("intake_preliminary_research")
+        driver.act(action)
+        analyst = driver.next()
+        self.assertFalse(analyst["parallel"])
+
+    def test_report_on_an_unknown_step_is_refused(self):
+        driver = Driver(temp_root(self), slug="unknown")
+        driver.next()
+        answer = driver.report("s-999", 1)
+        self.assertFalse(answer["accepted"])
+        self.assertEqual(["unknown_step: s-999"], answer["errors"])
+
+
+class CompletionTest(unittest.TestCase):
+    """§3.1: marker + input_sha + output sha + schema, before publication."""
+
+    def test_autoclose_rejects_previous_attempt_output(self):
+        # §3.1 rule 3: a marker of the previous attempt never closes the current one.
+        driver = Driver(temp_root(self), slug="autoclose")
+        action = driver.run_until("research")
+        step = {"step_id": action["step_id"], "attempt": 1}
+        doctrine = next(agent for agent in action["agents"] if agent["slot"] == "doctrine")
+        for agent in action["agents"]:
+            probe.run_fixture_agent(driver.work_dir, driver.state(), step, agent)
+        driver.report(action["step_id"], 1, agent="statutes")
+        driver.report(action["step_id"], 1, agent="case_law")
+        driver.report(action["step_id"], 1, agent="doctrine", status="fail")
+
+        retry = driver.next()
+        self.assertEqual(2, retry["attempt"])
+        self.assertEqual(["doctrine"], [agent["slot"] for agent in retry["agents"]])
+        self.assertFalse((driver.work_dir / "research/doctrine.json").is_file())
+
+        # The a1 output and marker are still on disk; they must not close a2.
+        self.assertTrue(
+            (driver.work_dir / doctrine["expected_outputs"][0]["work_path"]).is_file()
+        )
+        again = driver.next()
+        self.assertEqual("research", driver.state()["current_phase"])
+        self.assertEqual(3, again["attempt"])
+        self.assertEqual("recovery", again["reason"])
+        self.assertFalse((driver.work_dir / "research/doctrine.json").is_file())
+
+    def test_autoclose_publishes_a_slot_that_finished_without_a_report(self):
+        driver = Driver(temp_root(self), slug="autoclose-ok")
+        action = driver.run_until("research")
+        step = {"step_id": action["step_id"], "attempt": action["attempt"]}
+        for agent in action["agents"]:
+            probe.run_fixture_agent(driver.work_dir, driver.state(), step, agent)
+        driver.next()
+        self.assertEqual("research_sufficiency", driver.state()["current_phase"])
+        self.assertTrue((driver.work_dir / "research/doctrine.json").is_file())
+        autoclosed = [
+            row
+            for row in events.read_events(driver.work_dir)
+            if row["event"] == "step_autoclosed" and row["data"]["step_id"] == action["step_id"]
+        ]
+        self.assertEqual(3, len(autoclosed))
+
+    def test_partial_dispatch_resume_keeps_accepted_slots(self):
+        driver = Driver(temp_root(self), slug="partial")
+        action = driver.run_until("research")
+        driver.act(action, skip_slots=("doctrine",))
+        resumed = driver.next()
+        self.assertEqual(action["step_id"], resumed["step_id"])
+        self.assertEqual(2, resumed["attempt"])
+        self.assertEqual(["doctrine"], [agent["slot"] for agent in resumed["agents"]])
+        row = machine.step_row(driver.state(), action["step_id"], 1)
+        statuses = {agent["slot"]: agent["status"] for agent in row["agents"]}
+        self.assertEqual("ok", statuses["statutes"])
+        self.assertEqual("ok", statuses["case_law"])
+        self.assertTrue((driver.work_dir / "research/statutes.json").is_file())
+
+    def test_late_superseded_result_rejected(self):
+        driver = Driver(temp_root(self), slug="late")
+        action = driver.run_until("research")
+        driver.act(action, skip_slots=("doctrine",))
+        driver.next()  # attempt 2 is now current
+        late = driver.report(action["step_id"], 1, agent="doctrine", status="ok")
+        self.assertFalse(late["accepted"])
+        self.assertEqual(["identity_mismatch"], late["errors"])
+        self.assertEqual(2, late["current_attempt"])
+
+    def test_preseeded_draft_is_not_completed_revision(self):
+        # §3.1: for a vN revision `sha == seed` is a failure, not a completed step.
+        driver = Driver(temp_root(self), slug="preseed")
+        reviewers = driver.run_until("revision_loop")
+        self._act_reviewers_with_blocker(driver, reviewers)
+        writer = None
+        for _ in range(6):
+            action = driver.next()
+            if action["kind"] == "dispatch" and action["agents"][0]["subagent_type"].endswith("memo-writer"):
+                writer = action
+                break
+            driver.act(action)
+        self.assertIsNotNone(writer, "the revision loop never dispatched the writer")
+
+        agent = writer["agents"][0]
+        canonical = agent["expected_outputs"][0]["canonical"]
+        self.assertEqual("drafts/v2.md", canonical)
+        work_path = driver.work_dir / agent["expected_outputs"][0]["work_path"]
+        self.assertTrue(work_path.is_file(), "vN is pre-seeded into the writer workspace")
+        self.assertEqual(
+            state_io.sha256_file(driver.work_dir / canonical), state_io.sha256_file(work_path)
+        )
+
+        # The writer returns the seed untouched: the completion check must refuse it.
+        machine.run_agent_log(
+            namespace(
+                workdir=str(driver.work_dir),
+                step=writer["step_id"],
+                attempt=writer["attempt"],
+                slot=agent["slot"],
+                state="done",
+                detail=None,
+                mcp=None,
+            )
+        )
+        answer = driver.report(writer["step_id"], writer["attempt"], agent=agent["slot"])
+        self.assertFalse(answer["accepted"])
+        self.assertIn("writer_output_identical_to_seed", answer["errors"])
+        row = machine.step_row(driver.state(), writer["step_id"], writer["attempt"])
+        self.assertEqual("fail", row["agents"][0]["status"])
+        self.assertIsNone(row["status"])
+
+    def test_a_writer_that_never_changes_the_draft_ends_the_loop_under_manual_review(self):
+        # A43-1 / D-153: two identical returns spend the retry; the seed is not a new version.
+        driver = Driver(temp_root(self), slug="writer-stuck")
+        reviewers = driver.run_until("revision_loop")
+        self._act_reviewers_with_blocker(driver, reviewers)
+        writer = None
+        for _ in range(6):
+            action = driver.next()
+            if action["kind"] == "dispatch" and action["agents"][0]["subagent_type"].endswith("memo-writer"):
+                writer = action
+                break
+            driver.act(action)
+        self.assertIsNotNone(writer)
+        slot = writer["agents"][0]["slot"]
+
+        def return_seed_untouched(step_id: str, attempt: int) -> dict:
+            machine.run_agent_log(
+                namespace(
+                    workdir=str(driver.work_dir), step=step_id, attempt=attempt, slot=slot,
+                    state="done", detail=None, mcp=None,
+                )
+            )
+            return driver.report(step_id, attempt, agent=slot)
+
+        first = return_seed_untouched(writer["step_id"], writer["attempt"])
+        self.assertIn("writer_output_identical_to_seed", first["errors"])
+        retry = driver.next()  # reason: failure, attempt 2 of the same step
+        self.assertEqual(writer["step_id"], retry["step_id"])
+        self.assertEqual(writer["attempt"] + 1, retry["attempt"])
+        second = return_seed_untouched(retry["step_id"], retry["attempt"])
+        self.assertIn("writer_output_identical_to_seed", second["errors"])
+
+        following = driver.next()
+        state = driver.state()
+        self.assertEqual("export", state["current_phase"], following)
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+        self.assertIn("writer_failed", state["final_status_reasons"])
+        self.assertEqual("drafts/v1.md", state["current_draft_path"])
+        self.assertEqual(1, state["current_iteration"])
+        self.assertTrue(state["remaining_blocking_issues"], "the reviewers' open blockers travel to the deliverable")
+        self.assertIn("revision_incomplete", [row["banner_id"] for row in state["fallback_banners"]])
+        # No reviewer was dispatched on the unchanged bytes.
+        reviewer_steps = [
+            row for row in state["steps"]
+            if row.get("kind") == "dispatch" and row.get("phase") == "revision_loop"
+            # `steps[].agents[]` keeps the bare `agent_type`; `subagent_type` is only in the action.
+            and any(a["agent_type"].endswith("-reviewer") for a in row.get("agents") or [])
+        ]
+        self.assertEqual(1, len({row["step_id"] for row in reviewer_steps}), "only the iteration-1 reviewers ran")
+
+    def test_a_stuck_writer_on_an_unclean_v1_is_exported_and_delivered_as_v1(self):
+        # D-158: with no checked version left, `export_draft_sha` falls back to the last one — so the
+        # seed the revision rejected has to leave `draft_versions[]`, or the memo is delivered as v2.
+        driver = Driver(temp_root(self), slug="writer-stuck-unclean")
+        reviewers = driver.run_until("revision_loop")
+        self._act_reviewers_with_blocker(driver, reviewers)
+        self._spend_the_writer_on_the_seed(driver)
+        # v1 still carries a mechanical blocker after its fix budget: both deterministic reports
+        # drifted from `published[]`, so D-68 leaves `lint_clean`/`citations_clean` false everywhere.
+        for name in ("lint.json", "citations.json"):
+            report = state_io.read_json(driver.work_dir / name)
+            report["tampered"] = True
+            state_io.write_json_atomic(driver.work_dir / name, report)
+
+        driver.next()  # the writer step closes `fail` and the loop exits to `export`
+        state = driver.state()
+        self.assertEqual("export", state["current_phase"])
+        self.assertEqual(
+            [1],
+            [int(row["version"]) for row in state["draft_versions"]],
+            "the rejected seed is not a version the export may select",
+        )
+        self.assertFalse(
+            any(row["lint_clean"] and row["citations_clean"] for row in state["draft_versions"]),
+            "the scenario is `no_checked_draft`: nothing vouches for v1 either",
+        )
+
+        driver.run_to_end()
+        state = driver.state()
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+        self.assertIn("writer_failed", state["final_status_reasons"])
+        self.assertIn("no_checked_draft", state["final_status_reasons"])
+        self.assertEqual(1, state["current_iteration"])
+        delivered = [
+            name for name in ("deliverable.docx", "deliverable.md") if (driver.work_dir / name).is_file()
+        ]
+        self.assertTrue(delivered, "M9: the run still delivers")
+
+    def test_a_stuck_writer_hands_over_the_open_majors_of_the_version_it_delivers(self):
+        # D-210: the writer-failed exit delivers v1, so the majors v1's reviewers left open go with it.
+        driver = Driver(temp_root(self), slug="writer-stuck-majors")
+        reviewers = driver.run_until("revision_loop")
+        major = {
+            "severity": "major",
+            "category": "unsupported_conclusion",
+            "section_id": "s-4",
+            "issue": "The conclusion of 4 does not follow from the rule it applies.",
+            "suggestion": "Tie the conclusion to the facts the rule needs.",
+        }
+        self._act_reviewers_with_blocker(driver, reviewers, major=major)
+        self._spend_the_writer_on_the_seed(driver)
+        driver.next()  # the writer step closes `fail` and the loop exits to `export`
+
+        state = driver.state()
+        self.assertEqual("export", state["current_phase"])
+        self.assertIn("writer_failed", state["final_status_reasons"])
+        rows = state["open_substance_majors"]
+        self.assertEqual(
+            [("om-1", "logic", 1, "s-4", "unsupported_conclusion", major["issue"], "open")],
+            [
+                (row["id"], row["class"], row["from_iteration"], row["section_id"], row["category"], row["issue"],
+                 row["status"])
+                for row in rows
+            ],
+        )
+        self.assertEqual(review.open_substance_majors(state, 1), rows)
+
+    def _spend_the_writer_on_the_seed(self, driver: Driver) -> None:
+        """Both writer attempts return `drafts/v2.md` exactly as `revision next` seeded it (D-153)."""
+        writer = None
+        for _ in range(6):
+            action = driver.next()
+            if action["kind"] == "dispatch" and action["agents"][0]["subagent_type"].endswith("memo-writer"):
+                writer = action
+                break
+            driver.act(action)
+        self.assertIsNotNone(writer, "the revision loop never dispatched the writer")
+        slot = writer["agents"][0]["slot"]
+        step = {"step_id": writer["step_id"], "attempt": writer["attempt"]}
+        for index in range(2):
+            _agent_done(driver, step, slot)
+            answer = driver.report(step["step_id"], step["attempt"], agent=slot)
+            self.assertIn("writer_output_identical_to_seed", answer["errors"])
+            if index == 0:
+                retry = driver.next()  # reason: failure, attempt 2 of the same step
+                step = {"step_id": retry["step_id"], "attempt": retry["attempt"]}
+
+    @staticmethod
+    def _act_reviewers_with_blocker(driver: Driver, action: dict, *, major: dict | None = None) -> None:
+        """Every reviewer approves except `logic`, which raises a grounded hard-fail blocker (and `major`)."""
+        from memoforge import review as review_module
+
+        hard_fail = next(item["id"] for item in review_module.load_checklist("logic") if item["hard_fail"])
+        step = {"step_id": action["step_id"], "attempt": action["attempt"]}
+        for agent in action["agents"]:
+            slot = agent["slot"]
+            probe.run_fixture_agent(driver.work_dir, driver.state(), step, agent)
+            if slot == "logic":
+                target = driver.work_dir / agent["expected_outputs"][0]["work_path"]
+                document = state_io.read_json(target)
+                for item in document["checklist"]:
+                    if item["id"] == hard_fail:
+                        item["pass"] = False
+                document["issues"] = [
+                    {
+                        "severity": "blocker",
+                        "category": "rule_unexplained",
+                        "section_id": "s-3",
+                        "issue": "The rule is applied before it is explained.",
+                        "suggestion": "Explain the provision before applying it.",
+                        "checklist_id": hard_fail,
+                    }
+                ] + ([major] if major else [])
+                document["verdict"] = "needs_revision"
+                state_io.write_json_atomic(target, document)
+                machine.run_agent_log(
+                    namespace(
+                        workdir=str(driver.work_dir),
+                        step=action["step_id"],
+                        attempt=action["attempt"],
+                        slot=slot,
+                        state="done",
+                        detail=None,
+                        mcp=None,
+                    )
+                )
+            driver.report(action["step_id"], action["attempt"], agent=slot)
+
+
+MISSING_TOKEN_ISSUE = {
+    "severity": "blocker",
+    "category": "unsupported_claim",
+    "section_id": "s-4-2",
+    "issue": "The rule statement carries no [[src:]] token.",
+    "suggestion": "Add the token of the provision the sentence states.",
+    "issue_category": "unsupported_claim",
+}
+"""D-165: the single blocker the 2026-09-16 run could not close inside its iteration budget."""
+
+
+def _next_reviewer_dispatch(driver: Driver, *, limit: int = 12) -> dict:
+    """Advance until `next` dispatches the reviewers of an iteration; the action is not acted on."""
+    for _ in range(limit):
+        action = driver.next()
+        if action.get("errors"):
+            raise AssertionError(f"next failed: {action['errors']}")
+        if action["kind"] == "dispatch" and all(
+            agent["slot"] in review.REVIEWER_KINDS for agent in action["agents"]
+        ):
+            return action
+        driver.act(action)
+    raise AssertionError("the revision loop never dispatched reviewers again")
+
+
+def _next_writer_dispatch(driver: Driver, *, limit: int = 8) -> dict:
+    for _ in range(limit):
+        action = driver.next()
+        if action.get("errors"):
+            raise AssertionError(f"next failed: {action['errors']}")
+        if action["kind"] == "dispatch" and action["agents"][0]["subagent_type"].endswith("memo-writer"):
+            return action
+        driver.act(action)
+    raise AssertionError("the revision loop never dispatched the writer")
+
+
+class TargetedCitationFixTest(unittest.TestCase):
+    """D-165: the budget ends on one missing `[[src:]]` token, so one writer pass + `citations` runs."""
+
+    @staticmethod
+    def _act_reviewers_with_a_missing_token(driver: Driver, action: dict) -> None:
+        """Every reviewer approves except `citations`, which reports one `unsupported_claim`."""
+        step = {"step_id": action["step_id"], "attempt": action["attempt"]}
+        for agent in action["agents"]:
+            slot = agent["slot"]
+            probe.run_fixture_agent(driver.work_dir, driver.state(), step, agent)
+            if slot == "citations":
+                target = driver.work_dir / agent["expected_outputs"][0]["work_path"]
+                document = state_io.read_json(target)
+                document["issues"] = [dict(MISSING_TOKEN_ISSUE)]
+                document["verdict"] = "needs_revision"
+                state_io.write_json_atomic(target, document)
+                _agent_done(driver, action, slot)
+            driver.report(action["step_id"], action["attempt"], agent=slot)
+
+    def _run_to_the_targeted_reviewer(self, driver: Driver) -> dict:
+        """Drive iterations 1–2, then branch 9's writer, and stop on the citations-only dispatch."""
+        first = driver.run_until("revision_loop")
+        CompletionTest._act_reviewers_with_blocker(driver, first)
+        second = _next_reviewer_dispatch(driver)
+        self.assertEqual(2, driver.state()["current_iteration"])
+        self._act_reviewers_with_a_missing_token(driver, second)
+
+        writer = _next_writer_dispatch(driver)
+        self.assertEqual("drafts/v3.md", writer["agents"][0]["expected_outputs"][0]["canonical"])
+        # D-208: a token only where a pack source holds the rule; otherwise withdraw or qualify.
+        self.assertIn(
+            ". Targeted pass: for each named item, add the source token where a pack source contains the rule; "
+            "otherwise withdraw the statement or qualify it as unresolved. Change nothing else.",
+            writer["agents"][0]["prompt"],
+        )
+        state = driver.state()
+        self.assertEqual(1, state["attempts"]["targeted_fix"])
+        self.assertEqual({"iteration": 3, "reviewers": ["citations"]}, state["targeted_fix"])
+        self.assertEqual(3, state["current_iteration"])
+        driver.act(writer)
+
+        third = _next_reviewer_dispatch(driver)
+        self.assertEqual(["citations"], [agent["slot"] for agent in third["agents"]])
+        return third
+
+    def test_the_targeted_pass_closes_the_memo_when_the_token_is_added(self):
+        driver = Driver(temp_root(self), slug="targeted-fix")
+        third = self._run_to_the_targeted_reviewer(driver)
+        driver.act(third)  # the citations reviewer approves v3
+        driver.run_to_end()
+
+        state = driver.state()
+        self.assertEqual("approved_on_v3", state["final_status"])
+        self.assertEqual(1, state["attempts"]["targeted_fix"])
+        record = review.iteration_record(state, 3)
+        self.assertEqual(["citations"], record["reviewers"])
+        self.assertEqual(["citations"], record["coverage"])
+        self.assertEqual([], record["failed_reviewers"])
+
+    def test_a_token_still_missing_after_the_targeted_pass_forces_the_exit(self):
+        driver = Driver(temp_root(self), slug="targeted-fix-open")
+        third = self._run_to_the_targeted_reviewer(driver)
+        self._act_reviewers_with_a_missing_token(driver, third)
+        driver.run_to_end()
+
+        state = driver.state()
+        self.assertEqual("forced_exit_on_v3_with_remaining_issues", state["final_status"])
+        self.assertEqual(1, state["attempts"]["targeted_fix"])
+        self.assertTrue(state["remaining_blocking_issues"])
+
+
+class DeclaredInputTest(unittest.TestCase):
+    """D-114: the §3.1 rejection says why an input sha moved — the agent rewrote its own input."""
+
+    def test_input_sha_mismatch_names_the_cause(self):
+        work_dir = temp_root(self) / "memo-20260101T000000Z-input-sha"
+        marker_dir = stepctx.step_dir(work_dir, "s-009", 1, "currency")
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        state_io.write_json_atomic(
+            marker_dir / "done.json",
+            {
+                "task_id": "memo-20260101T000000Z-input-sha",
+                "step_id": "s-009",
+                "attempt": 1,
+                "slot": "currency",
+                "input_sha": {"research/sources.json": "b" * 64},
+                "output_sha": {},
+            },
+        )
+        row = {
+            "step_id": "s-009",
+            "attempt": 1,
+            "inputs": {"research/sources.json": "a" * 64},
+            "expected_outputs": [
+                {
+                    "work_path": "steps/s-009/a1/currency/currency.json",
+                    "canonical_path": "research/currency.json",
+                    "schema": "currency",
+                }
+            ],
+        }
+        completion = machine.check_completion(
+            work_dir, {}, row, {"slot": "currency", "agent_type": "memoforge:currency-checker"}
+        )
+        self.assertFalse(completion["ok"])
+        self.assertIn(
+            "input_sha_mismatch: research/sources.json (declared input changed during the step"
+            " — agents must not run sources verify/liveness/register on their own input)",
+            completion["errors"],
+        )
+
+
+class BudgetTest(unittest.TestCase):
+    """§2.2: a `reason: failure` retry spends exactly one budget; recovery spends none."""
+
+    def test_research_dispatch_retry_is_spent_once_then_the_run_continues(self):
+        driver = Driver(temp_root(self), slug="budget")
+        action = driver.run_until("research")
+        driver.act(action, fail_slots=("doctrine",))
+        retry = driver.next()
+        self.assertEqual("failure", retry["reason"])
+        self.assertEqual(["doctrine"], [agent["slot"] for agent in retry["agents"]])
+        self.assertEqual(1, driver.state()["attempts"]["research_dispatch_retry"])
+
+        driver.act(retry, fail_slots=("doctrine",))
+        after = driver.next()
+        self.assertEqual(1, driver.state()["attempts"]["research_dispatch_retry"])
+        self.assertEqual("research_sufficiency", driver.state()["current_phase"])
+        self.assertEqual(["case_law", "statutes"], driver.state()["dispatched_researchers"])
+        self.assertTrue(
+            any("doctrine" in str(row.get("message")) for row in driver.state()["drafting_warnings"])
+        )
+        # §2.2: the budget test asserts the number of real dispatches, not only the counter.
+        researcher_rows = [
+            row
+            for row in driver.state()["steps"]
+            if row["kind"] == "dispatch" and machine.agent_names(row) == ["legal-researcher"] * len(row["agents"])
+        ]
+        self.assertEqual(2, len(researcher_rows))
+        self.assertEqual("dispatch", after["kind"])
+
+    def test_zero_valid_layers_go_to_the_insufficient_gate(self):
+        driver = Driver(temp_root(self), slug="nolayers")
+        action = driver.run_until("research")
+        slots = tuple(agent["slot"] for agent in action["agents"])
+        driver.act(action, fail_slots=slots)
+        retry = driver.next()
+        driver.act(retry, fail_slots=slots)
+        follow = driver.next()
+        self.assertEqual("research_insufficient_pending", follow["phase"])
+        self.assertEqual("gate-text", follow["kind"])
+
+
+class InlineAndPlanBudgetTest(unittest.TestCase):
+    """§2.2: `inline_llm_retry` and `plan_edit`."""
+
+    def test_inline_llm_retry_budget_ends_in_failed(self):
+        # §2.2/§3.1: a rejected inline result closes its attempt; the next one is a new identity
+        # with `reason: failure` and the schema errors of the previous try (Codex 3).
+        driver = Driver(temp_root(self), slug="inline")
+        action = driver.run_until("planning")
+        step_id = action["step_id"]
+        for attempt in range(1, limits.MAX_INLINE_LLM_RETRY + 2):
+            self.assertEqual(attempt, action["attempt"])
+            target = driver.work_dir / action["write_to"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            state_io.write_json_atomic(target, {"not": "a plan"})
+            answer = driver.report(step_id, attempt)
+            self.assertFalse(answer["accepted"])
+            self.assertEqual(attempt + 1, answer["retry"]["attempt"])
+            self.assertEqual(attempt, driver.state()["attempts"]["inline_llm_retry"][step_id])
+            self.assertEqual("fail", machine.step_row(driver.state(), step_id, attempt)["status"])
+            # The same report a second time is the no-op of a closed step: no second charge.
+            repeat = driver.report(step_id, attempt)
+            self.assertTrue(repeat["already_reported"])
+            self.assertEqual(attempt, driver.state()["attempts"]["inline_llm_retry"][step_id])
+            action = driver.next()
+            if action["kind"] != "inline-llm":
+                break
+            self.assertEqual(step_id, action["step_id"])
+            self.assertEqual("failure", action["reason"])
+            self.assertIn("rejected", action["instruction"])
+        self.assertEqual("script", action["kind"])
+        self.assertIn("plan_invalid", action["command"])
+        machine.run_command(list(action["command"]))
+        self.assertEqual("failed", driver.state()["current_phase"])
+
+    def test_reported_fail_is_not_undone_by_the_file_left_behind(self):
+        # Codex 3: after `report --status fail` the leftover output must not autoclose the step.
+        driver = Driver(temp_root(self), slug="inline-fail")
+        action = driver.run_until("planning")
+        target = driver.work_dir / action["write_to"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        state_io.write_json_atomic(target, probe.fixture_plan())
+        answer = driver.report(action["step_id"], action["attempt"], status="fail")
+        self.assertFalse(answer["accepted"])
+        self.assertIn("reported_fail", answer["errors"])
+
+        retry = driver.next()
+        self.assertEqual("inline-llm", retry["kind"])
+        self.assertEqual(action["step_id"], retry["step_id"])
+        self.assertEqual(2, retry["attempt"])
+        self.assertEqual("failure", retry["reason"])
+        self.assertNotEqual(action["write_to"], retry["write_to"])
+        self.assertTrue(target.is_file())
+        self.assertFalse((driver.work_dir / "plan.json").is_file())
+        self.assertEqual("planning", driver.state()["current_phase"])
+
+    def test_plan_edit_becomes_the_task_of_the_next_planning_step(self):
+        # Codex 11 / §2.4 Edit: the planner gets the previous plan and the correction itself.
+        driver = Driver(temp_root(self), slug="planedit-task")
+        gate = driver.run_until("plan_approval_pending")
+        driver.report(
+            gate["step_id"],
+            gate["attempt"],
+            answers=json.dumps({"Plan": "Edit", "Change": "add the Irish rules"}),
+            generation=gate.get("generation", 0),
+        )
+        action = driver.next()
+        self.assertEqual("inline-llm", action["kind"])
+        self.assertEqual("planning", action["phase"])
+        self.assertIn("`plan.json`", action["instruction"])
+        self.assertIn("add the Irish rules", action["instruction"])
+        self.assertTrue((driver.work_dir / "plan.json").is_file())
+
+    def test_plan_edit_budget_forces_approve_of_the_last_version(self):
+        driver = Driver(temp_root(self), slug="planedit")
+        edit = json.dumps({"Plan": "Edit"})
+        for round_number in range(1, limits.MAX_PLAN_EDIT + 1):
+            gate = driver.run_until("plan_approval_pending")
+            driver.report(
+                gate["step_id"], gate["attempt"], answers=edit, generation=gate.get("generation", 0)
+            )
+            driver.next()
+            self.assertEqual("planning", driver.state()["current_phase"])
+            self.assertEqual(round_number, driver.state()["attempts"]["plan_edit"])
+        gate = driver.run_until("plan_approval_pending")
+        driver.report(
+            gate["step_id"], gate["attempt"], answers=edit, generation=gate.get("generation", 0)
+        )
+        # §2.2: the forced approval belongs to the version that carries the last correction, so the
+        # edit is executed first and only the plan it produced is approved.
+        planning = driver.next()
+        self.assertEqual("inline-llm", planning["kind"])
+        self.assertEqual("planning", planning["phase"])
+        self.assertEqual(limits.MAX_PLAN_EDIT + 1, driver.state()["attempts"]["plan_edit"])
+        driver.act(planning)
+        after = driver.next()
+        state = driver.state()
+        self.assertEqual("research", state["current_phase"])
+        self.assertEqual("dispatch", after["kind"])
+        self.assertEqual(limits.MAX_PLAN_EDIT + 1, state["attempts"]["plan_edit"])
+        self.assertTrue(
+            any(row["banner_id"] == "plan_forced_approve" for row in state["fallback_banners"])
+        )
+
+
+class GateRoutingTest(unittest.TestCase):
+    """§2.4: gates only on segment boundaries, generation and the text fallback."""
+
+    def test_no_gate_inside_segment(self):
+        driver = Driver(temp_root(self), slug="segment")
+        for _ in range(200):
+            action = driver.next()
+            if action["kind"] == "terminal":
+                break
+            if action["kind"] in ("gate-text", "gate-auq"):
+                self.assertTrue(
+                    phases.is_gate(str(action["phase"])),
+                    f"gate issued in non-gate phase {action['phase']}",
+                )
+            driver.act(action)
+
+    def test_auq_gate_carries_the_plan_digest_on_issue_and_reissue(self):
+        """D-86: the plan gate hands the router the plan to print before the AskUserQuestion."""
+        driver = Driver(temp_root(self), slug="auq-digest")
+        issued = driver.run_until("plan_approval_pending")
+        reissued = driver.next()
+        self.assertTrue(reissued.get("reissued"))
+        self.assertEqual(issued["step_id"], reissued["step_id"])
+        for action in (issued, reissued):
+            self.assertEqual("gate-auq", action["kind"])
+            text = str(action.get("text") or "")
+            self.assertTrue(text.strip(), "gate-auq must carry the plan as `text`")
+            self.assertIn("plan.json", text)
+            self.assertIn("Retention of customer records", text)
+            self.assertNotIn("Recommended mode", text)
+            self.assertNotIn("Reply with one of:", text)
+        self.assertEqual(issued["text"], reissued["text"])
+
+    def test_auq_no_answer_switches_to_equivalent_text_gate(self):
+        driver = Driver(temp_root(self), slug="auq")
+        auq = driver.run_until("plan_approval_pending")
+        self.assertEqual("gate-auq", auq["kind"])
+        self.assertEqual(0, auq["generation"])
+        self.assertIn("`approve [style:<name>|standard] [sources:reduced]`", auq["text_fallback"])
+
+        answer = driver.report(auq["step_id"], auq["attempt"], status="no_answer")
+        self.assertTrue(answer["accepted"])
+        self.assertEqual(1, answer["generation"])
+        switched = [r for r in events.read_events(driver.work_dir) if r["event"] == "gate_channel_switched"]
+        self.assertEqual(1, len(switched))
+
+        text_gate = driver.next()
+        self.assertEqual("gate-text", text_gate["kind"])
+        self.assertEqual(auq["step_id"], text_gate["step_id"])
+        self.assertEqual(1, text_gate["generation"])
+        self.assertIn("`approve [style:<name>|standard] [sources:reduced]`", text_gate["text"])
+
+        stale = driver.parse_gate({**text_gate, "generation": 0}, "approve full")
+        self.assertEqual(["stale_generation"], stale["errors"])
+
+        driver.parse_gate(text_gate, "approve full")
+        driver.next()
+        self.assertEqual("research", driver.state()["current_phase"])
+        self.assertEqual("full", driver.state()["mode"])
+
+    def test_report_answers_without_generation_is_rejected(self):
+        # §3.1 order / D-34: identity -> generation -> closed; an answer must name its channel.
+        driver = Driver(temp_root(self), slug="generation")
+        auq = driver.run_until("plan_approval_pending")
+        before = driver.state()
+        answer = driver.report(
+            auq["step_id"], auq["attempt"], answers=json.dumps({"Plan": "Approve"})
+        )
+        self.assertFalse(answer["accepted"])
+        self.assertEqual(["generation_required"], answer["errors"])
+        self.assertEqual(auq["generation"], answer["expected_generation"])
+        self.assertEqual(before, driver.state())
+        self.assertIsNone(
+            machine.step_row(driver.state(), auq["step_id"], auq["attempt"])["status"]
+        )
+
+    def test_currency_regate_route_to_followup_gate(self):
+        driver = Driver(temp_root(self), slug="regate")
+        action = driver.run_until("currency_check")
+        while action["kind"] != "dispatch":
+            driver.act(action)
+            action = driver.next()
+        agent = action["agents"][0]
+        target = driver.work_dir / agent["expected_outputs"][0]["work_path"]
+        document = probe.fixture_currency(driver.work_dir)
+        critical = [
+            row["source_id"]
+            for row in document["sources"]
+            if row["source_id"].endswith("source-1")
+        ]
+        for row in document["sources"]:
+            if row["source_id"] in critical:
+                row["status"] = "do_not_use"
+        document["blocking"] = critical
+        target.parent.mkdir(parents=True, exist_ok=True)
+        state_io.write_json_atomic(target, document)
+        machine.run_agent_log(
+            namespace(
+                workdir=str(driver.work_dir),
+                step=action["step_id"],
+                attempt=action["attempt"],
+                slot=agent["slot"],
+                state="done",
+                detail=None,
+                mcp=None,
+            )
+        )
+        driver.report(action["step_id"], action["attempt"], agent=agent["slot"])
+        second_pass = driver.next()
+        self.assertEqual("research_sufficiency", driver.state()["current_phase"])
+        self.assertEqual(1, driver.state()["attempts"]["currency_regate"])
+
+        # The second sufficiency pass asks the user: the run re-enters the phase-7 gate (§2.1 row 6).
+        sufficiency_agent = second_pass["agents"][0]
+        target = driver.work_dir / sufficiency_agent["expected_outputs"][0]["work_path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        state_io.write_json_atomic(
+            target,
+            {
+                "reviewer": "research_sufficiency",
+                "overall_verdict": "targeted_followup_needed",
+                "blocking_gaps": [
+                    {
+                        "gap": "The retention period the client actually applies is unknown.",
+                        "target": "user",
+                        "status": "missing",
+                        "why_blocking": "The conclusion turns on it.",
+                        "followup_question": {
+                            "question": "Which retention period does the client apply today?",
+                            "header": "Period",
+                            "options": [
+                                {"label": "Five years", "description": "Statutory minimum."},
+                                {"label": "Seven years", "description": "Tax rule."},
+                            ],
+                            "default_assumption_if_skipped": "Seven years.",
+                        },
+                    }
+                ],
+                "drafting_warnings": [],
+            },
+        )
+        machine.run_agent_log(
+            namespace(
+                workdir=str(driver.work_dir),
+                step=second_pass["step_id"],
+                attempt=second_pass["attempt"],
+                slot=sufficiency_agent["slot"],
+                state="done",
+                detail=None,
+                mcp=None,
+            )
+        )
+        driver.report(second_pass["step_id"], second_pass["attempt"], agent=sufficiency_agent["slot"])
+        gate = None
+        for _ in range(6):  # D-57 renders the sufficiency view before `sufficiency route`
+            gate = driver.next()
+            if gate["kind"] != "script":
+                break
+            machine.run_command(list(gate["command"]))
+        self.assertEqual("gate-text", gate["kind"])
+        self.assertEqual("research_sufficiency_followup_pending", gate["phase"])
+        self.assertIn("Which retention period", gate["text"])
+
+    def test_cancel_after_interruption_in_each_autonomous_phase(self):
+        for phase in ("research", "research_sufficiency", "currency_check", "drafting"):
+            with self.subTest(phase=phase):
+                driver = Driver(temp_root(self), slug="cancel-" + phase.replace("_", "-"))
+                driver.run_until(phase)
+                before = len(driver.state()["steps"])
+                state_io.write_state(
+                    driver.work_dir, lambda current: current.update({"cancel_requested": True})
+                )
+                step = driver.next()
+                self.assertEqual("script", step["kind"])
+                self.assertIn("finalize", step["command"])
+                machine.run_command(list(step["command"]))
+                final = driver.next()
+                self.assertEqual("terminal", final["kind"])
+                self.assertEqual("cancelled_by_user", driver.state()["current_phase"])
+                self.assertLessEqual(len(driver.state()["steps"]), before + 3)
+
+
+class ReviewLoopTest(unittest.TestCase):
+    """§4.5: the deterministic checks come before the reviewers; polish is re-checked."""
+
+    def test_reviewers_not_dispatched_until_lint_clean_or_rounds_exhausted(self):
+        driver = Driver(temp_root(self), slug="reviewers")
+        order: list[str] = []
+        for _ in range(200):
+            action = driver.next()
+            if action["kind"] == "terminal":
+                break
+            if action["phase"] in ("drafting", "revision_loop"):
+                if action["kind"] == "script":
+                    order.append(machine.command_key(action["command"]))
+                elif action["kind"] == "dispatch":
+                    order.append("dispatch:" + ",".join(a["slot"] for a in action["agents"]))
+            driver.act(action)
+        reviewer_index = next(
+            index for index, name in enumerate(order) if name.startswith("dispatch:logic")
+        )
+        self.assertIn("draft.finish", order[:reviewer_index])
+
+    def test_polish_changes_go_through_lint_and_citations(self):
+        driver = Driver(temp_root(self), slug="polish")
+        action = driver.run_until("client_readiness")
+        agent = action["agents"][0]
+        target = driver.work_dir / agent["expected_outputs"][0]["work_path"]
+        document = probe.fixture_client_readiness(str(driver.state()["current_draft_sha"]), 1)
+        document["verdict"] = "needs_final_polish"
+        document["issues"] = [
+            {
+                "section_id": "s-3",
+                "severity": "minor",
+                "issue": "The conclusion could name the owner earlier.",
+                "suggestion": "Move the owner to the first sentence.",
+            }
+        ]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        state_io.write_json_atomic(target, document)
+        machine.run_agent_log(
+            namespace(
+                workdir=str(driver.work_dir),
+                step=action["step_id"],
+                attempt=action["attempt"],
+                slot=agent["slot"],
+                state="done",
+                detail=None,
+                mcp=None,
+            )
+        )
+        driver.report(action["step_id"], action["attempt"], agent=agent["slot"])
+
+        polish = driver.next()
+        self.assertEqual("dispatch", polish["kind"])
+        self.assertEqual("memo-writer", polish["agents"][0]["subagent_type"].split(":")[-1])
+        self.assertEqual(1, driver.state()["attempts"]["client_polish"])
+        driver.act(polish)
+
+        order: list[str] = []
+        for _ in range(6):
+            step = driver.next()
+            if step["kind"] == "script":
+                order.append(machine.command_key(step["command"]))
+            elif step["kind"] == "dispatch":
+                order.append("dispatch:" + step["agents"][0]["subagent_type"].split(":")[-1])
+                break
+            else:
+                break
+            driver.act(step)
+        self.assertEqual(["draft.finish", "dispatch:client-readiness-reviewer"], order)
+
+
+class ProgressTest(unittest.TestCase):
+    """§2.2 `progress`: the denominator is the reachable route of the current config."""
+
+    def test_progress_denominator_matches_route(self):
+        full = Driver(temp_root(self), slug="progress-full")
+        full.run_until("research")
+        progress = full.state()["progress"]
+        self.assertEqual(progress["total"], len(progress["route"]))
+        self.assertEqual(13, progress["total"])
+        self.assertIn("source_review_pending", progress["route"])
+        self.assertEqual(5, progress["position"])
+
+        # The route follows the config: without the source-review gate it is one phase shorter.
+        gateless = Driver(
+            temp_root(self), slug="progress-no-review", user_config={"source_review_gate": "off"}
+        )
+        gateless.run_until("research")
+        progress = gateless.state()["progress"]
+        self.assertEqual(progress["total"], len(progress["route"]))
+        self.assertEqual(12, progress["total"])
+        self.assertNotIn("source_review_pending", progress["route"])
+
+    def test_description_uses_the_route_denominator(self):
+        driver = Driver(temp_root(self), slug="description")
+        action = driver.run_until("research")
+        for agent in action["agents"]:
+            self.assertTrue(agent["description"].startswith("P5/13 · legal-researcher · "))
+
+
+class McpCallCountTest(unittest.TestCase):
+    """D-217: a call the hook saw and the agent also reported is counted once (§4.3)."""
+
+    def journal(self, rows: list[tuple[str, str, str]]) -> Path:
+        """`events.jsonl` of `(ts seconds, actor, server)` rows, in journal order."""
+        work_dir = temp_root(self)
+        lines = []
+        for second, actor, server in rows:
+            record = events.build_event("mcp_call", actor, {"server": server, "tool": "search"})
+            record["ts"] = f"2026-09-22T10:00:{second}.000Z"
+            lines.append(json.dumps(record))
+        events.events_path(work_dir).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return work_dir
+
+    def test_a_self_report_after_the_first_hook_call_is_not_counted_again(self):
+        work_dir = self.journal(
+            [
+                ("01", "hook", "uklegal"),
+                ("02", "statutes", "uklegal"),
+                ("03", "hook", "uklegal"),
+                ("04", "statutes", "uklegal"),
+                ("05", "hook", "uklegal"),
+            ]
+        )
+        self.assertEqual({"uklegal": 3}, machine.mcp_call_counts(work_dir))
+        self.assertEqual(5, len(events.read_events(work_dir)), "the self-reports stay in the journal")
+
+    def test_without_a_hook_every_self_report_counts(self):
+        work_dir = self.journal([("01", "statutes", "casus"), ("02", "case_law", "casus"), ("03", "currency", "ldh")])
+        self.assertEqual({"casus": 2, "ldh": 1}, machine.mcp_call_counts(work_dir))
+
+    def test_a_hook_that_starts_mid_run_keeps_the_earlier_self_reports(self):
+        work_dir = self.journal(
+            [
+                ("01", "statutes", "casus"),
+                ("02", "statutes", "casus"),
+                ("03", "case_law", "ldh"),
+                ("04", "case_law", "ldh"),
+                ("05", "case_law", "casus"),
+                ("06", "hook", "casus"),
+            ]
+        )
+        self.assertEqual({"casus": 4, "ldh": 2}, machine.mcp_call_counts(work_dir))
+
+
+class CrashIdempotenceTest(unittest.TestCase):
+    """§2.2: a crash between the file action and the state close is replayed, not repeated."""
+
+    STEP_COMMANDS = (
+        "sufficiency.route",
+        "sources.pack",
+        "draft.finish",
+        "review.aggregate",
+        "revision.next",
+        "docx.render",
+        "finalize",
+    )
+
+    def test_crash_between_action_and_step_close_is_idempotent(self):
+        driver = Driver(temp_root(self), slug="crash")
+        seen: set[str] = set()
+        for _ in range(200):
+            action = driver.next()
+            if action["kind"] == "terminal":
+                break
+            if action["kind"] == "script":
+                key = machine.command_key(action["command"])
+                if key in self.STEP_COMMANDS and key not in seen:
+                    seen.add(key)
+                    with self.subTest(command=key):
+                        first = machine.run_command(list(action["command"]))
+                        published_before = _published_shas(driver.state())
+                        # Crash after the command, before the orchestrator called `next`: the repeat
+                        # is a no-op returning the stored result, and `next` does not re-run it.
+                        second = machine.run_command(list(action["command"]))
+                        self.assertFalse(second.get("errors"), second)
+                        self.assertEqual(
+                            published_before,
+                            _published_shas(driver.state()),
+                            f"{key} republished different content on a repeat",
+                        )
+                        row = machine.step_row(driver.state(), action["step_id"], action["attempt"])
+                        self.assertEqual("ok", row["status"])
+                        self.assertIsInstance(first, dict)
+                    continue
+            driver.act(action)
+        self.assertEqual(set(self.STEP_COMMANDS), seen)
+
+    def test_unclosed_script_step_is_replayed_by_next(self):
+        driver = Driver(temp_root(self), slug="replay")
+        action = driver.run_until("currency_check")
+        self.assertEqual("script", action["kind"])
+        self.assertEqual("sources.liveness", machine.command_key(action["command"]))
+        # The orchestrator never ran the command: `next` replays it and closes the step.
+        follow = driver.next()
+        row = machine.step_row(driver.state(), action["step_id"], action["attempt"])
+        self.assertEqual("ok", row["status"])
+        self.assertNotEqual(action["step_id"], follow["step_id"])
+
+
+class StepAwareScriptTest(unittest.TestCase):
+    """D-28: `sources liveness|verify` and `docx validate` are ordinary `--step/--attempt` steps."""
+
+    D28_COMMANDS = (("sources", "liveness"), ("sources", "verify"), ("docx", "validate"))
+
+    def test_every_script_command_carries_its_identity(self):
+        driver = Driver(temp_root(self), slug="d28")
+        for tokens in self.D28_COMMANDS:
+            with self.subTest(command=".".join(tokens)):
+                action = machine.script_step(
+                    driver.work_dir, driver.state(), *tokens, chat="probe"
+                )
+                command = list(action["command"])
+                self.assertIn("--step", command)
+                self.assertIn("--attempt", command)
+                self.assertEqual(action["step_id"], command[command.index("--step") + 1])
+                self.assertEqual(
+                    str(action["attempt"]), command[command.index("--attempt") + 1]
+                )
+                self.assertIn(".".join(tokens), machine.SELF_CLOSING)
+
+    def test_no_completion_predicate_second_guesses_the_orchestrator(self):
+        self.assertFalse(hasattr(machine, "REPLAY_COMPLETE"))
+        self.assertFalse(hasattr(machine, "_sources_checked"))
+
+
+class LintAttachmentTest(unittest.TestCase):
+    """D-39: `lint.json`/`citations.json` reach the reviewers only on `lint_not_converged`."""
+
+    def _driver(self, slug: str, *, clean: bool, banner: bool) -> Driver:
+        driver = Driver(temp_root(self), slug=slug)
+        sha = "a" * 64
+        for name in ("lint.json", "citations.json"):
+            state_io.write_json_atomic(
+                driver.work_dir / name, {"draft_sha": sha, "clean": clean}
+            )
+
+        def mutate(state: dict) -> None:
+            state["current_draft_sha"] = sha
+            state["current_draft_path"] = "drafts/v1.md"
+            if banner:
+                state["fallback_banners"] = [
+                    {
+                        "banner_id": "lint_not_converged",
+                        "condition_key": "lint_not_converged",
+                        "text": "…",
+                    }
+                ]
+
+        state_io.write_state(driver.work_dir, mutate)
+        return driver
+
+    def _attachment(self, driver: Driver) -> str:
+        state = driver.state()
+        return machine.lint_attachment(
+            driver.work_dir, state, str(state.get("current_draft_sha") or "")
+        )
+
+    def test_unconverged_and_dirty_draft_attaches_the_reports(self):
+        driver = self._driver("d39-attach", clean=False, banner=True)
+        self.assertIn("lint.json", self._attachment(driver))
+
+    def test_dirty_draft_without_the_banner_attaches_nothing(self):
+        driver = self._driver("d39-rounds-left", clean=False, banner=False)
+        self.assertEqual("", self._attachment(driver))
+
+    def test_clean_draft_attaches_nothing_even_after_the_banner(self):
+        driver = self._driver("d39-clean", clean=True, banner=True)
+        self.assertEqual("", self._attachment(driver))
+
+    def test_the_reviewer_spec_carries_the_computed_attachment(self):
+        driver = self._driver("d39-spec", clean=False, banner=False)
+        specs = machine.reviewer_specs(driver.work_dir, driver.state(), ["logic"], 1)
+        self.assertEqual("", specs[0]["extra"]["lint_attachment"])
+
+
+class DraftCheckRerunTest(unittest.TestCase):
+    """D-54: `draft finish` belongs to the draft sha it ran on (Codex 1, 7; D-117 merged the three)."""
+
+    def _writer_dispatch(self, driver: Driver) -> dict:
+        action = driver.run_until("drafting")
+        while action["kind"] != "dispatch":  # D-57 renders the writer's md views first
+            driver.act(action)
+            action = driver.next()
+        return action
+
+    def test_writer_fix_re_issues_both_checks_for_the_new_bytes(self):
+        driver = Driver(temp_root(self), slug="d54")
+        writer = self._writer_dispatch(driver)
+        _act_writer(driver, writer, edit=BREAK_RISK)
+        # D-117: one step does the anchors, the lint and the citation audit.
+        finish = driver.next()
+        self.assertEqual("draft.finish", machine.command_key(finish["command"]), finish)
+        result = machine.run_command(list(finish["command"]))
+        self.assertGreaterEqual(result["anchor"]["anchors_inserted"], 1)
+        self.assertIn("clean", result["lint"])
+        self.assertIn("clean", result["citations"])
+
+        fix = driver.next()
+        self.assertEqual("dispatch", fix["kind"])
+        self.assertEqual("memo-writer", fix["agents"][0]["subagent_type"].split(":")[-1])
+        self.assertEqual(1, driver.state()["attempts"]["lint_fix"]["1"])
+        before = driver.state()["current_draft_sha"]
+        _act_writer(driver, fix)
+        self.assertNotEqual(before, driver.state()["current_draft_sha"])
+
+        rerun = driver.next()
+        self.assertEqual("script", rerun["kind"])
+        self.assertEqual("draft.finish", machine.command_key(rerun["command"]))
+        self.assertEqual(finish["step_id"], rerun["step_id"])
+        self.assertEqual(2, rerun["attempt"])
+        self.assertEqual("rerun", rerun["reason"])
+        # The rerun is free and the fix budget is untouched: no second fix, no `lint_not_converged`.
+        self.assertEqual(1, driver.state()["attempts"]["lint_fix"]["1"])
+        driver.act(rerun)
+        state = driver.state()
+        sha = machine.current_draft_sha(state)
+        for name in ("lint.json", "citations.json"):
+            self.assertIsNotNone(machine.report_for_draft(driver.work_dir, state, name, sha), name)
+
+    def test_report_that_drifted_from_published_is_not_a_verdict(self):
+        # D-41: `_draft_checks` reads through `published[]`; drift re-issues the check.
+        driver = Driver(temp_root(self), slug="d41-lint")
+        _drive_to_script(driver, "draft.finish")
+        self.assertEqual((True, True), machine._draft_checks(driver.work_dir, driver.state()))
+        report = state_io.read_json(driver.work_dir / "lint.json")
+        report["findings"] = list(report.get("findings") or [])
+        report["_tampered"] = True
+        state_io.write_json_atomic(driver.work_dir / "lint.json", report)
+        self.assertEqual((False, True), machine._draft_checks(driver.work_dir, driver.state()))
+
+        step = driver.next()
+        self.assertEqual("script", step["kind"])
+        self.assertEqual("draft.finish", machine.command_key(step["command"]))
+        self.assertEqual("drafting", driver.state()["current_phase"])
+
+
+def _ask_for_polish(driver: Driver, action: dict) -> None:
+    """Answer the client-readiness dispatch with `needs_final_polish` (§2.1 row 14)."""
+    agent = action["agents"][0]
+    target = driver.work_dir / agent["expected_outputs"][0]["work_path"]
+    document = probe.fixture_client_readiness(str(driver.state()["current_draft_sha"]), 1)
+    document["verdict"] = "needs_final_polish"
+    document["issues"] = [
+        {
+            "section_id": "s-3",
+            "severity": "minor",
+            "issue": "The conclusion could name the owner earlier.",
+            "suggestion": "Move the owner to the first sentence.",
+        }
+    ]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    state_io.write_json_atomic(target, document)
+    _agent_done(driver, action, agent["slot"])
+    driver.report(action["step_id"], action["attempt"], agent=agent["slot"])
+
+
+class PinpointNotInRawTest(unittest.TestCase):
+    """D-204: a C-09 starts the ordinary lint-fix round of v1 — and changes nothing anywhere else."""
+
+    PHANTOM = ("art 5(1)(e)]]", "art 9(2)]]")
+    """The fixture draft's pinpoint moved to an article its saved text never prints."""
+
+    def _code_saved(self, driver: Driver) -> None:
+        """Every saved text becomes code-saved before the freeze pins the kinds (D-200)."""
+        registry = sources.read_registry(driver.work_dir)
+        for record in registry["sources"].values():
+            if record.get("raw_path"):
+                record["raw_kind"] = "full_text"
+        with sources.sources_lock(driver.work_dir):
+            sources.write_registry(driver.work_dir, registry)
+
+    def _v1_with_phantom(self, slug: str) -> Driver:
+        """A full-mode run up to `draft finish` of a v1 whose only defect is a C-09."""
+        driver = Driver(temp_root(self), slug=slug)
+        driver.run_until("source_pack")
+        self._code_saved(driver)
+        action = driver.run_until("drafting")
+        while action["kind"] != "dispatch":  # D-57 renders the writer's md views first
+            driver.act(action)
+            action = driver.next()
+        _act_writer(driver, action, edit=self.PHANTOM)
+        _drive_to_script(driver, "draft.finish")
+        state = driver.state()
+        self.assertEqual((True, True), machine._draft_checks(driver.work_dir, state))
+        self.assertTrue(self._c09(driver), "the phantom pinpoint must draw a C-09")
+        return driver
+
+    @staticmethod
+    def _c09(driver: Driver) -> list[dict]:
+        report = state_io.read_json(driver.work_dir / "citations.json")
+        return [row for row in report["findings"] if row["rule"] == "C-09"]
+
+    def test_c09_alone_runs_one_lint_fix_round_then_the_loop_without_the_banner(self):
+        driver = self._v1_with_phantom("c09-round")
+        self.assertTrue(machine._has_c09(driver.work_dir, driver.state()))
+
+        fix = driver.next()
+        self.assertEqual("dispatch", fix["kind"])
+        self.assertTrue(fix["agents"][0]["subagent_type"].endswith("memo-writer"), fix)
+        self.assertIn("fix the pinpoint or remove it", fix["agents"][0]["prompt"])
+        self.assertEqual(1, driver.state()["attempts"]["lint_fix"]["1"])
+        _act_writer(driver, fix)  # the fixture writer edits another sentence: the phantom stays
+        _drive_to_script(driver, "draft.finish")
+        self.assertTrue(machine._has_c09(driver.work_dir, driver.state()))
+
+        action = driver.next()
+        state = driver.state()
+        self.assertEqual("revision_loop", state["current_phase"])
+        self.assertEqual("dispatch", action["kind"])
+        self.assertFalse(
+            any(agent["subagent_type"].endswith("memo-writer") for agent in action["agents"]),
+            "the reviewers, not a second fix",
+        )
+        # Full mode allows two rounds for blockers; a C-09 alone buys exactly one.
+        self.assertEqual(2, state["config"]["lint_fix_rounds"])
+        self.assertEqual(1, state["attempts"]["lint_fix"]["1"])
+        self.assertFalse(machine._lint_not_converged(state), "C-09 alone never raises the banner")
+
+    def test_a_leftover_c09_ends_in_the_ordinary_export_with_its_appendix_line(self):
+        driver = self._v1_with_phantom("c09-export")
+        driver.run_to_end()
+        state = driver.state()
+        self.assertEqual("done", state["current_phase"])
+        self.assertEqual("approved_on_v1", state["final_status"])
+        self.assertFalse(machine._lint_not_converged(state))
+        self.assertEqual(1, state["attempts"]["lint_fix"]["1"])
+        self.assertTrue(all(row["citations_clean"] for row in state["draft_versions"]))
+
+        leftover = self._c09(driver)
+        self.assertEqual(1, len(leftover), leftover)
+        note = md_fallback.label(
+            "pinpoint_not_in_raw_note", pinpoint="art 9(2)", source_id=leftover[0]["source_id"]
+        )
+        views = list(driver.work_dir.glob("memo-*.md"))
+        self.assertTrue(views, "the markdown view always ships")
+        self.assertIn(note, views[0].read_text(encoding="utf-8"))
+        with zipfile.ZipFile(driver.work_dir / "deliverable.docx") as archive:
+            self.assertIn(note, archive.read("word/document.xml").decode("utf-8"))
+
+    def test_the_polish_path_is_untouched_by_c09(self):
+        driver = self._v1_with_phantom("c09-polish")
+        _ask_for_polish(driver, driver.run_until("client_readiness"))
+        polish = driver.next()
+        self.assertTrue(polish["agents"][0]["subagent_type"].endswith("memo-writer"))
+        driver.act(polish)
+
+        order: list[str] = []
+        for _ in range(6):
+            step = driver.next()
+            if step["kind"] == "script":
+                order.append(machine.command_key(step["command"]))
+            elif step["kind"] == "dispatch":
+                order.append("dispatch:" + step["agents"][0]["subagent_type"].split(":")[-1])
+                break
+            else:
+                break
+            driver.act(step)
+        self.assertEqual(["draft.finish", "dispatch:client-readiness-reviewer"], order)
+        self.assertTrue(machine._has_c09(driver.work_dir, driver.state()), "the phantom survived the polish")
+        self.assertNotIn("polish", driver.state()["attempts"].get("lint_fix") or {})
+
+    def test_has_c09_reads_the_report_of_the_current_draft_only(self):
+        driver = Driver(temp_root(self), slug="c09-predicate")
+        sha = "a" * 64
+
+        def mutate(state: dict) -> None:
+            state["current_draft_sha"] = sha
+            state["current_draft_path"] = "drafts/v1.md"
+
+        state_io.write_state(driver.work_dir, mutate)
+        c09 = {
+            "rule": "C-09",
+            "severity": "major",
+            "line": 3,
+            "section_id": "s-3",
+            "excerpt": "Body [[src:x ст. 9]].",
+            "hint": "Pinpoint `ст. 9` …",
+            "source_id": "x",
+            "pinpoint": "ст. 9",
+        }
+        for findings, draft_sha, expected in (
+            ([c09], sha, True),
+            ([dict(c09, rule="C-08")], sha, False),
+            ([], sha, False),
+            ([c09], "b" * 64, False),
+        ):
+            with self.subTest(findings=[row["rule"] for row in findings], draft_sha=draft_sha[:1]):
+                state_io.write_json_atomic(
+                    driver.work_dir / "citations.json",
+                    {"draft_sha": draft_sha, "clean": True, "findings": findings},
+                )
+                self.assertEqual(expected, machine._has_c09(driver.work_dir, driver.state()))
+
+
+class DraftFinishContractTest(unittest.TestCase):
+    """D-117: the merged command keeps what the three commands it replaced guaranteed."""
+
+    def _to_finish(
+        self,
+        slug: str,
+        *,
+        edit: tuple[str, str] | None = None,
+        rewrite=None,
+    ) -> tuple[Driver, dict]:
+        """Write v1 (optionally edited) and stop on the `draft finish` step without running it."""
+        driver = Driver(temp_root(self), slug=slug)
+        action = driver.run_until("drafting")
+        while action["kind"] != "dispatch":  # D-57 renders the writer's md views first
+            driver.act(action)
+            action = driver.next()
+        if rewrite is None:
+            _act_writer(driver, action, edit=edit)
+        else:
+            agent = action["agents"][0]
+            step = {"step_id": action["step_id"], "attempt": action["attempt"]}
+            probe.run_fixture_agent(driver.work_dir, driver.state(), step, agent)
+            target = driver.work_dir / agent["expected_outputs"][0]["work_path"]
+            target.write_bytes(rewrite(target.read_text(encoding="utf-8-sig")).encode("utf-8"))
+            _agent_done(driver, action, agent["slot"])
+            driver.report(action["step_id"], action["attempt"], agent=agent["slot"])
+        finish = driver.next()
+        self.assertEqual("draft.finish", machine.command_key(finish["command"]), finish)
+        return driver, finish
+
+    @staticmethod
+    def _draft(driver: Driver) -> Path:
+        return driver.work_dir / str(driver.state()["current_draft_path"])
+
+    def _interrupt(self, driver: Driver, finish: dict) -> None:
+        """Run `draft finish` up to the anchor publication and die before `close_step` (§2.2)."""
+        with mock.patch.object(stepctx, "close_step", side_effect=RuntimeError("interrupted")):
+            with self.assertRaises(RuntimeError):
+                machine.run_command(list(finish["command"]))
+        state = driver.state()
+        row = machine.step_row(state, finish["step_id"], finish["attempt"])
+        self.assertIn(row.get("status"), (None, ""), "the step must still be open")
+        # The canonical draft is the anchored text; `published[]` still holds the pre-anchor sha.
+        self.assertEqual(
+            stepctx.OUTPUT_MODIFIED,
+            stepctx.verify_published(driver.work_dir, state, str(state["current_draft_path"])),
+        )
+
+    def test_a_replay_after_an_interrupted_anchor_recovers_from_the_staged_input(self):
+        """D-42 × D-117: the replay must not read its own anchored bytes as a foreign edit."""
+        driver, finish = self._to_finish("d117-replay")
+        self._interrupt(driver, finish)
+
+        result = machine.run_command(list(finish["command"]))
+        self.assertNotIn("errors", result)
+        self.assertTrue(result["replay_recovered"])
+        self.assertEqual(state_io.sha256_file(self._draft(driver)), result["draft_sha"])
+
+        state = driver.state()
+        path = str(state["current_draft_path"])
+        self.assertIsNone(stepctx.verify_published(driver.work_dir, state, path))
+        self.assertEqual("ok", machine.step_row(state, finish["step_id"], finish["attempt"])["status"])
+        self.assertEqual(result["draft_sha"], machine.current_draft_sha(state))
+        for name in ("lint.json", "citations.json"):
+            self.assertIsNotNone(
+                machine.report_for_draft(driver.work_dir, state, name, result["draft_sha"]), name
+            )
+        after = driver.next()
+        self.assertNotIn("errors", after)
+        self.assertNotEqual("draft.finish", machine.command_key(after.get("command")))
+
+    def test_a_hand_edit_after_the_interrupted_anchor_is_still_refused(self):
+        """D-41: the recovery is sha-exact — anything the anchor did not produce stays a drift."""
+        driver, finish = self._to_finish("d117-foreign")
+        self._interrupt(driver, finish)
+        path = self._draft(driver)
+        path.write_bytes(path.read_bytes() + b"\nA later hand edit.\n")
+
+        result = machine.run_command(list(finish["command"]))
+        self.assertEqual([stepctx.OUTPUT_MODIFIED], result["errors"])
+
+    def test_a_duplicate_section_anchor_is_refused_before_the_draft_is_touched(self):
+        """D-130 × D-117: `draft finish` refuses the collision `draft anchor` refuses."""
+        driver, finish = self._to_finish(
+            "d130-finish", edit=("## 4. Conclusion", "## 3. Conclusion")
+        )
+        path = self._draft(driver)
+        before = state_io.sha256_file(path)
+
+        result = machine.run_command(list(finish["command"]))
+        self.assertTrue(result["errors"], result)
+        for message in result["errors"]:
+            self.assertTrue(message.startswith("duplicate_section_anchor: s-3 on lines "), message)
+        self.assertEqual(before, state_io.sha256_file(path), "the canonical draft is untouched")
+        self.assertIsNone(stepctx.verify_published(driver.work_dir, driver.state(), result["draft"]))
+        for name in ("lint.json", "citations.json"):
+            self.assertFalse((driver.work_dir / name).exists(), name)
+
+    def test_the_citation_majors_reach_the_orchestrator(self):
+        """D-131 × D-117: Full, one major and no blocker — the merged command still says «major»."""
+        driver, finish = self._to_finish("d131-majors", edit=(" art 5(1)(e)]]", "]]"))
+        result = machine.run_command(list(finish["command"]))
+
+        findings = state_io.read_json(driver.work_dir / "citations.json")["findings"]
+        majors = sum(1 for row in findings if row["severity"] == "major")
+        self.assertGreaterEqual(majors, 1, findings)
+        self.assertEqual(0, result["citations"]["blockers"])
+        self.assertTrue(result["citations"]["clean"], "a major is not a blocker (§5.4)")
+        self.assertEqual(majors, result["citations"]["majors"])
+        self.assertGreaterEqual(result["majors"], majors)
+
+        stored = machine.step_row(
+            driver.state(), finish["step_id"], finish["attempt"]
+        )["result_ref"]["result"]
+        self.assertEqual(majors, stored["citations"]["majors"])
+        self.assertEqual(result["majors"], stored["majors"])
+        self.assertEqual(result["blockers"], stored["blockers"])
+
+    @staticmethod
+    def _uncite(text: str) -> str:
+        """Drop every `[[src:]]` token and the quoted line: the packed rule source is then unused."""
+        kept = [row for row in text.splitlines() if "[[q:" not in row]
+        return re.sub(r"\s*\[\[src:[^\]]+\]\]", "", "\n".join(kept))
+
+    def test_an_uncited_rule_source_is_major(self):
+        """D-131: the merged command audits C-07 as the standalone audit does — `major` (D-243)."""
+        full, finish = self._to_finish("d131-full", rewrite=self._uncite)
+        result = machine.run_command(list(finish["command"]))
+        rows = state_io.read_json(full.work_dir / "citations.json")["findings"]
+        c07 = [row for row in rows if row["rule"] == "C-07"]
+        self.assertTrue(c07, rows)
+        self.assertEqual({"major"}, {row["severity"] for row in c07})
+        self.assertEqual(len(c07), result["citations"]["majors"], rows)
+
+
+class ReviewerRetryBudgetTest(unittest.TestCase):
+    """D-55: `reviewer_json_retry{iteration,kind}` — one counter per kind, owned by `review aggregate`."""
+
+    @staticmethod
+    def _reviewer_dispatch_slots(state: dict) -> int:
+        return sum(
+            len(row.get("agents") or [])
+            for row in state.get("steps") or []
+            if machine._is_reviewer_dispatch(row)
+        )
+
+    def _act(self, driver: Driver, action: dict, failing: tuple) -> None:
+        step = {"step_id": action["step_id"], "attempt": action["attempt"]}
+        for agent in action["agents"]:
+            if agent["slot"] in failing:
+                driver.report(action["step_id"], action["attempt"], agent=agent["slot"], status="fail")
+                continue
+            probe.run_fixture_agent(driver.work_dir, driver.state(), step, agent)
+            driver.report(action["step_id"], action["attempt"], agent=agent["slot"])
+
+    def test_group_failure_then_subset_failure_counts_one_key_per_kind(self):
+        driver = Driver(temp_root(self), slug="d55")
+        first = driver.run_until("revision_loop")
+        self.assertEqual(4, len(first["agents"]))
+        self._act(driver, first, tuple(agent["slot"] for agent in first["agents"]))
+
+        retry = driver.next()
+        self.assertEqual(first["step_id"], retry["step_id"])
+        self.assertEqual("failure", retry["reason"])
+        self.assertEqual(4, len(retry["agents"]))
+        # The machine only reads the counter: `review aggregate` is its only writer.
+        self.assertEqual({}, driver.state()["attempts"]["reviewer_json_retry"])
+
+        self._act(driver, retry, ("form", "logic"))
+        aggregate = driver.next()
+        self.assertEqual("review.aggregate", machine.command_key(aggregate["command"]))
+        driver.act(aggregate)
+
+        # D-69: the failure retry above already spent `1:form` and `1:logic`, so the aggregate
+        # stubs both kinds here instead of asking for a third dispatch of the same pair.
+        result = machine.result_of(machine.step_row(driver.state(), aggregate["step_id"]))
+        self.assertEqual("revision_next", result["next"])
+        self.assertEqual(["form", "logic"], result["failed_reviewers"])
+        self.assertEqual(
+            ["reviews/v1-form.json", "reviews/v1-logic.json"], sorted(result["stubs_written"])
+        )
+        # §2.2: the budget test counts the real dispatches — 4 + 4, never an unbounded retry.
+        self.assertEqual(8, self._reviewer_dispatch_slots(driver.state()))
+        self.assertEqual({}, driver.state()["attempts"]["reviewer_json_retry"])
+
+    def test_counters_survive_the_reviewer_rerun_of_revision_next(self):
+        driver = Driver(temp_root(self), slug="d55-rerun")
+        first = driver.run_until("revision_loop")
+        self._act(driver, first, ("form",))
+        retry = driver.next()
+        self.assertEqual(["form"], [agent["slot"] for agent in retry["agents"]])
+        self._act(driver, retry, ("form",))
+        driver.act(driver.next())  # review aggregate: the JSON budget is gone, `form` is a stub
+        revision = driver.next()
+        self.assertEqual("revision.next", machine.command_key(revision["command"]))
+        driver.act(revision)
+
+        state = driver.state()
+        # D-69: `reviewer_rerun` is a budget of its own — the coverage rerun of `revision next` is
+        # not a JSON retry and does not read the counter the machine and the aggregate share.
+        self.assertEqual({"1": 1}, state["attempts"]["reviewer_rerun"])
+        self.assertEqual({}, state["attempts"]["reviewer_json_retry"])
+
+
+class ScriptErrorPolicyTest(unittest.TestCase):
+    """§2.2: a CLI error is one recovery, then `finalize --reason cli_error` (Codex 5)."""
+
+    def test_failed_sources_pack_never_satisfies_the_next_phase(self):
+        driver = Driver(temp_root(self), slug="script-error")
+        action = driver.run_until("source_pack")
+        self.assertEqual("sources.pack", machine.command_key(action["command"]))
+        findings = driver.work_dir / "research" / "statutes.json"
+        findings.write_bytes(findings.read_bytes() + b"\n")  # drift from `published[]` (D-41)
+        self.assertTrue(machine.run_command(list(action["command"])).get("errors"))
+
+        recovery = driver.next()
+        self.assertEqual("script", recovery["kind"])
+        self.assertEqual("sources.pack", machine.command_key(recovery["command"]))
+        self.assertEqual(action["step_id"], recovery["step_id"])
+        self.assertEqual("recovery", recovery["reason"])
+        self.assertEqual("fail", machine.step_row(driver.state(), action["step_id"], 1)["status"])
+        machine.run_command(list(recovery["command"]))
+
+        exit_step = driver.next()
+        self.assertEqual("script", exit_step["kind"])
+        self.assertEqual("finalize", machine.command_key(exit_step["command"]))
+        self.assertIn("cli_error", exit_step["command"])
+        self.assertEqual("source_pack", driver.state()["current_phase"])
+        machine.run_command(list(exit_step["command"]))
+        self.assertEqual("failed", driver.state()["current_phase"])
+
+
+class NoChangeScopeTest(unittest.TestCase):
+    """D-53: the seed comparison belongs to `memo-writer`; acceptance comes before publication."""
+
+    def test_currency_output_identical_to_the_published_file_is_ok(self):
+        driver = Driver(temp_root(self), slug="d53-currency")
+        action = driver.run_until("currency_check")
+        while action["kind"] != "dispatch":
+            driver.act(action)
+            action = driver.next()
+        agent = action["agents"][0]
+        probe.run_fixture_agent(
+            driver.work_dir,
+            driver.state(),
+            {"step_id": action["step_id"], "attempt": action["attempt"]},
+            agent,
+        )
+        # The canonical file already holds exactly these bytes — for a non-writer that is `ok`.
+        stepctx.publish(
+            driver.work_dir,
+            action["step_id"],
+            action["attempt"],
+            agent["expected_outputs"][0]["work_path"],
+            "research/currency.json",
+        )
+        answer = driver.report(action["step_id"], action["attempt"], agent=agent["slot"])
+        self.assertTrue(answer["accepted"], answer)
+        row = machine.step_row(driver.state(), action["step_id"], action["attempt"])
+        self.assertEqual("ok", row["agents"][0]["status"])
+
+    def test_autoclose_publishes_nothing_before_the_acceptance_checks(self):
+        driver = Driver(temp_root(self), slug="d53-autoclose")
+        reviewers = driver.run_until("revision_loop")
+        CompletionTest._act_reviewers_with_blocker(driver, reviewers)
+        writer = None
+        for _ in range(8):
+            action = driver.next()
+            if action["kind"] == "dispatch" and action["agents"][0]["subagent_type"].endswith(
+                "memo-writer"
+            ):
+                writer = action
+                break
+            driver.act(action)
+        self.assertIsNotNone(writer, "the revision loop never dispatched the writer")
+
+        # The writer returns the pre-seeded v2 untouched and only writes its marker.
+        _agent_done(driver, writer, writer["agents"][0]["slot"])
+        before = _published_shas(driver.state())
+        follow = driver.next()
+        state = driver.state()
+        self.assertEqual("command", stepctx.published_entry(state, "drafts/v2.md")["by"])
+        self.assertEqual(before, _published_shas(state))
+        row = machine.step_row(state, writer["step_id"], writer["attempt"])
+        self.assertEqual("fail", row["agents"][0]["status"])
+        self.assertEqual("failure", follow["reason"])
+
+
+class ReadinessVerdictTest(unittest.TestCase):
+    """D-41 / §2.1 row 14: a readiness verdict is bound to the draft sha it reviewed (Codex 7)."""
+
+    def test_verdict_for_another_draft_is_rejected(self):
+        driver = Driver(temp_root(self), slug="d41-readiness")
+        action = driver.run_until("client_readiness")
+        agent = action["agents"][0]
+        target = driver.work_dir / agent["expected_outputs"][0]["work_path"]
+        document = probe.fixture_client_readiness("b" * 64, 1)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        state_io.write_json_atomic(target, document)
+        _agent_done(driver, action, agent["slot"])
+        driver.report(action["step_id"], action["attempt"], agent=agent["slot"])
+
+        again = driver.next()
+        self.assertEqual("dispatch", again["kind"])
+        self.assertEqual(
+            "client-readiness-reviewer", again["agents"][0]["subagent_type"].split(":")[-1]
+        )
+        self.assertNotEqual(action["step_id"], again["step_id"])
+        state = driver.state()
+        self.assertEqual("client_readiness", state["current_phase"])
+        self.assertFalse(state.get("client_readiness"), "a stale verdict was recorded")
+
+
+class FollowupSubsetTest(unittest.TestCase):
+    """Codex 12: the missing subset survives the gate, and sufficiency sees the dispatched layers."""
+
+    SUFFICIENCY = {
+        "reviewer": "research_sufficiency",
+        "overall_verdict": "targeted_followup_needed",
+        "blocking_gaps": [
+            {
+                "gap": "The retention period the client applies is unknown.",
+                "target": "user",
+                "status": "missing",
+                "why_blocking": "The conclusion turns on it.",
+                "followup_question": {
+                    "question": "Which retention period does the client apply today?",
+                    "header": "Period",
+                    "options": [
+                        {"label": "Five years", "description": "Statutory minimum."},
+                        {"label": "Seven years", "description": "Tax rule."},
+                    ],
+                    "default_assumption_if_skipped": "Seven years.",
+                },
+            },
+            {
+                "gap": "No commentary on the retention carve-out was found.",
+                "target": "doctrine",
+                "status": "missing",
+                "why_blocking": "The counterargument needs a secondary source.",
+            },
+        ],
+        "drafting_warnings": [],
+    }
+
+    def test_the_gate_answer_re_dispatches_exactly_the_missing_layers(self):
+        driver = Driver(temp_root(self), slug="followup-subset")
+        action = driver.run_until("research_sufficiency")
+        agent = action["agents"][0]
+        target = driver.work_dir / agent["expected_outputs"][0]["work_path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        state_io.write_json_atomic(target, self.SUFFICIENCY)
+        _agent_done(driver, action, agent["slot"])
+        driver.report(action["step_id"], action["attempt"], agent=agent["slot"])
+
+        gate = driver.next()
+        while gate["kind"] == "script":
+            driver.act(gate)
+            gate = driver.next()
+        self.assertEqual("research_sufficiency_followup_pending", gate["phase"])
+        driver.act(gate)
+
+        research = driver.next()
+        self.assertEqual("dispatch", research["kind"])
+        self.assertEqual("research", research["phase"])
+        self.assertEqual(["doctrine"], [item["slot"] for item in research["agents"]])
+        followup = driver.state()["sufficiency_followup"]
+        self.assertEqual("research_subset", followup["status"])
+        self.assertEqual(["doctrine"], machine.missing_layers(driver.state()))
+
+    def test_sufficiency_sees_the_layers_that_were_dispatched(self):
+        driver = Driver(temp_root(self), slug="dispatched-layers")
+        action = driver.run_until("research")
+        driver.act(action, fail_slots=("doctrine",))
+        retry = driver.next()
+        driver.act(retry, fail_slots=("doctrine",))
+        sufficiency = driver.next()
+        self.assertEqual("research_sufficiency", sufficiency["phase"])
+        self.assertEqual(["case_law", "statutes"], driver.state()["dispatched_researchers"])
+        prompt = sufficiency["agents"][0]["prompt"]
+        self.assertIn("`research/statutes.json`", prompt)
+        self.assertNotIn("research/doctrine.json", prompt)
+        self.assertEqual(
+            ["case_law", "statutes"], machine.research_layers(driver.work_dir, driver.state())
+        )
+
+
+class ModeScopedFollowupTest(unittest.TestCase):
+    """D-112: the follow-up of a sufficiency verdict stays within `config.researcher_layers`."""
+
+    SUFFICIENCY = {
+        "reviewer": "research_sufficiency",
+        "overall_verdict": "targeted_followup_needed",
+        "blocking_gaps": [
+            {
+                "gap": "The retention period the client applies is unknown.",
+                "target": "user",
+                "status": "missing",
+                "why_blocking": "The conclusion turns on it.",
+                "followup_question": {
+                    "question": "Which retention period does the client apply today?",
+                    "header": "Period",
+                    "options": [
+                        {"label": "Five years", "description": "Statutory minimum."},
+                        {"label": "Seven years", "description": "Tax rule."},
+                    ],
+                    "default_assumption_if_skipped": "Seven years.",
+                },
+            },
+            {
+                "gap": "No CJEU authority on the retention carve-out was located.",
+                "target": "case_law",
+                "status": "missing",
+                "why_blocking": "The conclusion rests on the statute alone.",
+            },
+            {
+                "gap": "No commentary on the retention carve-out was found.",
+                "target": "doctrine",
+                "status": "missing",
+                "why_blocking": "The counterargument needs a secondary source.",
+            },
+        ],
+        "drafting_warnings": [],
+    }
+
+    def _judge(self, driver: Driver) -> None:
+        """Run the sufficiency reviewer with the verdict above."""
+        action = driver.run_until("research_sufficiency")
+        agent = action["agents"][0]
+        target = driver.work_dir / agent["expected_outputs"][0]["work_path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        state_io.write_json_atomic(target, self.SUFFICIENCY)
+        _agent_done(driver, action, agent["slot"])
+        driver.report(action["step_id"], action["attempt"], agent=agent["slot"])
+
+    def test_the_same_verdict_in_full_mode_re_dispatches_both_layers(self):
+        driver = Driver(temp_root(self), slug="full-scope")
+        self._judge(driver)
+
+        gate = driver.next()
+        while gate["kind"] == "script":
+            driver.act(gate)
+            gate = driver.next()
+        self.assertEqual("research_sufficiency_followup_pending", gate["phase"])
+        self.assertEqual([], driver.state()["drafting_warnings"])
+        driver.act(gate)
+
+        research = driver.next()
+        self.assertEqual("research", research["phase"])
+        self.assertEqual(["case_law", "doctrine"], [item["slot"] for item in research["agents"]])
+
+    def test_target_layers_intersects_the_subset_with_the_configured_layers(self):
+        followup = {
+            "status": machine.RESEARCH_SUBSET_STATUS,
+            "subset_r": [
+                {"target": "case_law", "status": "missing"},
+                {"target": "statutes", "status": "missing"},
+            ],
+        }
+        work_dir = temp_root(self)
+        narrow = {"config": {"researcher_layers": ["statutes"]}, "sufficiency_followup": followup}
+        self.assertEqual(["statutes"], machine.missing_layers(narrow))
+        self.assertEqual(["statutes"], machine.target_layers(work_dir, narrow))
+        full = {
+            "config": {"researcher_layers": ["statutes", "case_law", "doctrine"]},
+            "sufficiency_followup": followup,
+        }
+        self.assertEqual(["case_law", "statutes"], machine.missing_layers(full))
+        self.assertEqual(["case_law", "statutes"], machine.target_layers(work_dir, full))
+
+
+class SufficiencyBudgetCombinationsTest(unittest.TestCase):
+    """D-116 / §2.1 rows 6–7: two budgets, four combinations — each buys exactly what it paid for."""
+
+    SPENT_USER = limits.MAX_SUFFICIENCY_USER_FOLLOWUP
+    SPENT_RESEARCH = limits.MAX_SUFFICIENCY_RESEARCH_FOLLOWUP
+
+    def _route(self, slug: str, *, user: int, research: int) -> tuple[Driver, dict]:
+        """Judge the research with the two counters already at `user`/`research`; return what follows."""
+        driver = Driver(temp_root(self), slug=slug)
+        action = driver.run_until("research_sufficiency")
+        agent = action["agents"][0]
+        target = driver.work_dir / agent["expected_outputs"][0]["work_path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        state_io.write_json_atomic(target, ModeScopedFollowupTest.SUFFICIENCY)
+        _agent_done(driver, action, agent["slot"])
+        driver.report(action["step_id"], action["attempt"], agent=agent["slot"])
+
+        def spend(current: dict) -> None:
+            counters = current.setdefault("attempts", {})
+            counters["sufficiency_user_followup"] = user
+            counters["sufficiency_research_followup"] = research
+
+        state_io.write_state(driver.work_dir, spend)
+        _drive_to_script(driver, "sufficiency.route")
+        return driver, driver.next()
+
+    @staticmethod
+    def _counters(driver: Driver) -> tuple[int, int]:
+        attempts = driver.state()["attempts"]
+        return (
+            int(attempts.get("sufficiency_user_followup", 0)),
+            int(attempts.get("sufficiency_research_followup", 0)),
+        )
+
+    @staticmethod
+    def _approved(driver: Driver) -> list[str]:
+        return driver.state()["sufficiency_followup"]["approved_layers"]
+
+    def test_both_budgets_left_asks_and_re_dispatches_the_named_layers(self):
+        driver, gate = self._route("budget-both", user=0, research=0)
+        self.assertEqual("research_sufficiency_followup_pending", gate["phase"])
+        self.assertEqual((1, 1), self._counters(driver), "one question and one research pass")
+        self.assertEqual(["case_law", "doctrine"], self._approved(driver))
+
+        driver.act(gate)
+        research = driver.next()
+        self.assertEqual("research", research["phase"])
+        self.assertEqual(["case_law", "doctrine"], [item["slot"] for item in research["agents"]])
+
+    def test_the_user_budget_alone_asks_without_buying_a_research_pass(self):
+        """N-01: `layers: []` was charged to nobody, so the answered gate may not dispatch one."""
+        driver, gate = self._route("budget-user", user=0, research=self.SPENT_RESEARCH)
+        self.assertEqual("research_sufficiency_followup_pending", gate["phase"])
+        self.assertEqual((1, self.SPENT_RESEARCH), self._counters(driver))
+        self.assertEqual([], self._approved(driver), "the research budget is gone")
+        self.assertEqual([], machine.missing_layers(driver.state()))
+        self.assertTrue(
+            [gap for gap in driver.state()["sufficiency_followup"]["subset_r"] if gap["status"] == "missing"],
+            "the gaps are still recorded — only re-deriving the layers from them is forbidden",
+        )
+
+        driver.act(gate)
+        after = driver.next()
+        self.assertEqual("research_sufficiency", after["phase"], "no unpaid research pass")
+        self.assertEqual(
+            ["research-sufficiency-reviewer"],
+            [item["subagent_type"].split(":")[-1] for item in after["agents"]],
+        )
+        self.assertEqual((1, self.SPENT_RESEARCH), self._counters(driver))
+
+    def test_the_research_budget_alone_re_dispatches_without_asking(self):
+        driver, research = self._route("budget-research", user=self.SPENT_USER, research=0)
+        self.assertEqual("research", research["phase"])
+        self.assertEqual(["case_law", "doctrine"], [item["slot"] for item in research["agents"]])
+        self.assertEqual((self.SPENT_USER, 1), self._counters(driver))
+        self.assertEqual(["case_law", "doctrine"], self._approved(driver))
+
+    def test_neither_budget_left_carries_the_gaps_as_warnings(self):
+        driver, action = self._route(
+            "budget-none", user=self.SPENT_USER, research=self.SPENT_RESEARCH
+        )
+        self.assertEqual("currency_check", action["phase"])
+        self.assertEqual((self.SPENT_USER, self.SPENT_RESEARCH), self._counters(driver))
+        self.assertEqual([], self._approved(driver))
+        self.assertTrue(driver.state()["drafting_warnings"])
+
+    def test_the_approved_set_beats_the_gaps_the_router_did_not_pay_for(self):
+        """D-116: `subset_r` is the reviewer's list of gaps, not a licence to re-dispatch them."""
+        followup = {
+            "status": machine.RESEARCH_SUBSET_STATUS,
+            "subset_r": [{"target": "case_law", "status": "missing"}],
+            "approved_layers": [],
+        }
+        state = {
+            "config": {"researcher_layers": ["statutes", "case_law"]},
+            "sufficiency_followup": followup,
+        }
+        self.assertEqual([], machine.missing_layers(state))
+        # A state written before the key existed still derives the set from the gaps.
+        legacy = {
+            "config": state["config"],
+            "sufficiency_followup": {"status": "answered", "subset_r": followup["subset_r"]},
+        }
+        self.assertEqual(["case_law"], machine.missing_layers(legacy))
+
+
+class ResearchLayerModelTest(unittest.TestCase):
+    """D-245: every research layer is dispatched on `opus`, the researcher's own row; no slot overrides it."""
+
+    SUFFICIENCY = {
+        "reviewer": "research_sufficiency",
+        "overall_verdict": "targeted_followup_needed",
+        "blocking_gaps": [
+            {
+                "gap": "The holding relied on for issue i1 stands only in a clause the judgment recites.",
+                "target": "case_law",
+                "status": "missing",
+                "why_blocking": "The conclusion for issue i1 rests on that holding.",
+            }
+        ],
+        "drafting_warnings": [],
+    }
+
+    @staticmethod
+    def _models(action: dict) -> dict:
+        return {item["slot"]: item["model"] for item in action["agents"]}
+
+    def test_the_researcher_specs_override_no_slot(self):
+        driver = Driver(temp_root(self), slug="layer-model-specs")
+        driver.run_until("plan_approval_pending")
+        specs = machine.researcher_specs(driver.work_dir, driver.state(), ["statutes", "case_law", "doctrine"])
+        self.assertEqual(
+            {"statutes": None, "case_law": None, "doctrine": None},
+            {spec["slot"]: spec["model"] for spec in specs},
+        )
+
+    def test_the_first_research_dispatch_runs_every_layer_on_opus(self):
+        driver = Driver(temp_root(self), slug="layer-models")
+        action = driver.run_until("research")
+        self.assertEqual("dispatch", action["kind"])
+        self.assertEqual({"statutes": "opus", "case_law": "opus", "doctrine": "opus"}, self._models(action))
+
+    def test_a_followup_for_case_law_alone_runs_on_opus(self):
+        driver = Driver(temp_root(self), slug="layer-models-followup")
+        action = driver.run_until("research_sufficiency")
+        agent = action["agents"][0]
+        target = driver.work_dir / agent["expected_outputs"][0]["work_path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        state_io.write_json_atomic(target, self.SUFFICIENCY)
+        _agent_done(driver, action, agent["slot"])
+        driver.report(action["step_id"], action["attempt"], agent=agent["slot"])
+
+        research = driver.run_until("research")
+        self.assertEqual("dispatch", research["kind"])
+        self.assertEqual({"case_law": "opus"}, self._models(research))
+
+
+class RenderViewsTest(unittest.TestCase):
+    """D-57: the md views are script steps in front of the agents that read them (Codex 13)."""
+
+    def test_writer_v1_is_dispatched_only_after_its_views_exist(self):
+        driver = Driver(temp_root(self), slug="d57-writer")
+        action = driver.run_until("drafting")
+        rendered: list[str] = []
+        while action["kind"] != "dispatch":
+            rendered.append(machine.command_key(action["command"]))
+            driver.act(action)
+            action = driver.next()
+        self.assertIn("render.research", rendered)
+        for layer in machine.research_layers(driver.work_dir, driver.state()):
+            self.assertTrue((driver.work_dir / f"research/{layer}.md").is_file(), layer)
+        named = self._paths_in(action["agents"][0]["prompt"], driver.work_dir)
+        self.assertTrue(named, "the writer prompt names no work-dir input at all")
+        for path in named:
+            self.assertTrue(path.is_file(), f"the writer prompt names a missing file: {path}")
+
+    def test_a_view_without_a_consumer_is_never_issued(self):
+        # D-62: `sufficiency route` and the writer read the JSON, and the gate-11 text is built by
+        # `sources.render_digest`, so these three views buy nothing and cost a script step each.
+        driver = Driver(temp_root(self), slug="d62-gates")
+        driver.run_until("currency_check")
+        driver.run_until("source_review_pending")
+        issued = [
+            machine.command_key(row["command"])
+            for row in driver.state()["steps"]
+            if row.get("kind") == "script"
+        ]
+        for view in ("render.sufficiency", "render.source-pack", "render.currency"):
+            self.assertNotIn(view, issued)
+        for name in (
+            "research/research-sufficiency.md",
+            "research/source-pack.md",
+            "research/currency.md",
+        ):
+            self.assertFalse((driver.work_dir / name).exists(), name)
+
+    def test_the_mediator_view_precedes_the_revision_writer(self):
+        driver = Driver(temp_root(self), slug="d57-mediator")
+        reviewers = driver.run_until("revision_loop")
+        CompletionTest._act_reviewers_with_blocker(driver, reviewers)
+        for _ in range(8):
+            action = driver.next()
+            if action["kind"] == "dispatch" and action["agents"][0]["subagent_type"].endswith(
+                "memo-writer"
+            ):
+                self.assertTrue((driver.work_dir / "reviews/v1-mediator.md").is_file())
+                # D-62: the writer is pointed at the rendered view, never at the state JSON.
+                prompt = action["agents"][0]["prompt"]
+                self.assertIn("`reviews/v1-mediator.md`", prompt)
+                self.assertNotIn("`reviews/v1-mediator.json`", prompt)
+                return
+            driver.act(action)
+        self.fail("the revision loop never dispatched the writer")
+
+    @staticmethod
+    def _paths_in(prompt: str, work_dir: Path) -> list[Path]:
+        """Work-dir files the prompt names in backticks; a glob must match at least one file."""
+        found: list[Path] = []
+        for token in re.findall(r"`([^`]+)`", prompt):
+            name = token.strip()
+            if not name.startswith("research/") or not name.endswith((".md", ".json")):
+                continue
+            if "*" not in name:
+                found.append(work_dir / name)
+                continue
+            matches = sorted(work_dir.glob(name))
+            found.extend(matches or [work_dir / name])
+        return found
+
+
+class AutocloseBookkeepingTest(unittest.TestCase):
+    """D-59: the autoclose branch of `next` keeps the same draft accounting as `report`."""
+
+    @staticmethod
+    def _writer_without_a_report(driver: Driver) -> dict:
+        """Run the drafting writer to completion and leave `mf report` uncalled (§2.1 rule 3)."""
+        action = driver.run_until("drafting")
+        for _ in range(20):
+            agents = action.get("agents") or [{}]
+            if action["kind"] == "dispatch" and str(
+                agents[0].get("subagent_type") or ""
+            ).endswith("memo-writer"):
+                break
+            driver.act(action)
+            action = driver.next()
+        else:
+            raise AssertionError("the drafting phase never dispatched the writer")
+        step = {"step_id": action["step_id"], "attempt": action["attempt"]}
+        probe.run_fixture_agent(driver.work_dir, driver.state(), step, action["agents"][0])
+        return action
+
+    def test_autoclose_records_the_draft_it_published(self):
+        driver = Driver(temp_root(self), slug="d59")
+        action = self._writer_without_a_report(driver)
+        before = driver.state()
+        self.assertIsNone(before.get("current_draft_path"))
+        driver.next()  # the autoclose branch closes the writer step
+
+        state = driver.state()
+        row = machine.step_row(state, action["step_id"], action["attempt"])
+        self.assertEqual("ok", row["status"])
+        self.assertEqual("drafts/v1.md", state["current_draft_path"])
+        self.assertEqual(
+            stepctx.published_sha(state, "drafts/v1.md"), state["current_draft_sha"]
+        )
+        self.assertEqual([1], [version["version"] for version in state["draft_versions"]])
+        self.assertEqual(1, state["current_iteration"])
+
+    def test_a_run_recovered_by_autoclose_still_ends_approved(self):
+        driver = Driver(temp_root(self), slug="d59-run")
+        self._writer_without_a_report(driver)
+        driver.run_to_end()
+        state = driver.state()
+        self.assertEqual("approved_on_v1", state["final_status"])
+        self.assertEqual([], state.get("final_status_reasons") or [])
+        self.assertEqual([1], [version["version"] for version in state["draft_versions"]])
+
+
+class PublishedReportsTest(unittest.TestCase):
+    """D-60/D-68: `lint.json`/`citations.json` reach the bookkeeping only through `published[]` (D-41)."""
+
+    def _tamper(self, driver: Driver, name: str) -> None:
+        report = state_io.read_json(driver.work_dir / name)
+        report["tampered"] = True  # any edit after publication changes the bytes
+        state_io.write_json_atomic(driver.work_dir / name, report)
+
+    def test_a_tampered_lint_report_revokes_the_mark_it_gave(self):
+        # D-68: the version is already marked clean — the drift has to take the mark away, so the
+        # state is left exactly as the run built it (no pre-reset of the flags).
+        driver = Driver(temp_root(self), slug="d68")
+        driver.run_until("revision_loop")
+        version = driver.state()["draft_versions"][0]
+        self.assertTrue(version["lint_clean"])
+        self.assertTrue(version["citations_clean"])
+
+        self._tamper(driver, "lint.json")
+        machine.sync_draft_versions(driver.work_dir)
+
+        state = driver.state()
+        row = state["draft_versions"][0]
+        self.assertFalse(row["lint_clean"], "a report edited after publication is no verdict")
+        self.assertTrue(row["citations_clean"], "the untouched report is still applied")
+        self.assertEqual(
+            [],
+            [
+                item
+                for item in state["draft_versions"]
+                if item["lint_clean"] and item["citations_clean"]
+            ],
+            "§2.1 row 15: the export must not pick the version as checked",
+        )
+
+    def test_both_reports_gone_leave_no_checked_version(self):
+        driver = Driver(temp_root(self), slug="d68-gone")
+        driver.run_until("revision_loop")
+        for name in ("lint.json", "citations.json"):
+            (driver.work_dir / name).unlink()
+
+        machine.sync_draft_versions(driver.work_dir)
+
+        row = driver.state()["draft_versions"][0]
+        self.assertFalse(row["lint_clean"])
+        self.assertFalse(row["citations_clean"])
+        self.assertIsNone(row["checked_at"])
+
+    def test_a_report_of_another_draft_leaves_the_version_it_checked(self):
+        # D-68: a readable report is a verdict for its own `draft_sha` only; the marks of the other
+        # versions come from their own reports and are not touched.
+        driver = Driver(temp_root(self), slug="d68-other")
+        driver.run_until("revision_loop")
+        checked = dict(driver.state()["draft_versions"][0])
+
+        def add_version(current: dict) -> None:
+            current["draft_versions"].append(
+                {
+                    "version": 2,
+                    "path": "drafts/v2.md",
+                    "sha256": "f" * 64,
+                    "lint_clean": False,
+                    "citations_clean": False,
+                    "checked_at": None,
+                }
+            )
+
+        state_io.write_state(driver.work_dir, add_version)
+        machine.sync_draft_versions(driver.work_dir)
+
+        rows = {row["version"]: row for row in driver.state()["draft_versions"]}
+        self.assertTrue(rows[1]["lint_clean"])
+        self.assertTrue(rows[1]["citations_clean"])
+        self.assertEqual(checked["checked_at"], rows[1]["checked_at"])
+        self.assertFalse(rows[2]["lint_clean"])
+        self.assertFalse(rows[2]["citations_clean"])
+
+
+class ReviewerBudgetKeyTest(unittest.TestCase):
+    """D-65: `reviewer_json_retry` is read per `<iteration>:<kind>` and outlives one `step_id`."""
+
+    def test_a_kind_with_budget_left_is_re_issued_when_another_kind_has_none(self):
+        driver = Driver(temp_root(self), slug="d65")
+        first = driver.run_until("revision_loop")
+        kinds = sorted(agent["slot"] for agent in first["agents"])
+        self.assertIn("logic", kinds)
+
+        def spend_logic(current: dict) -> None:
+            current.setdefault("attempts", {})["reviewer_json_retry"] = {"1:logic": 1}
+
+        state_io.write_state(driver.work_dir, spend_logic)
+        for agent in first["agents"]:
+            driver.report(
+                first["step_id"], first["attempt"], agent=agent["slot"], status="fail"
+            )
+
+        retry = driver.next()
+        self.assertEqual("dispatch", retry["kind"])
+        self.assertEqual("failure", retry["reason"])
+        self.assertEqual(
+            [kind for kind in kinds if kind != "logic"],
+            sorted(agent["slot"] for agent in retry["agents"]),
+        )
+
+    def test_a_rerun_under_a_new_step_id_keeps_the_failure_count(self):
+        # D-32: `review aggregate` reruns a kind under a new `step_id`; the machine's own failure
+        # retries are counted by `(iteration, kind)`, so the rerun does not reset them.
+        state = {
+            "current_iteration": 1,
+            "attempts": {},
+            "steps": [
+                {
+                    "step_id": "s-010",
+                    "kind": "dispatch",
+                    "phase": "revision_loop",
+                    "attempt": 2,
+                    "reason": "failure",
+                    "status": "fail",
+                    "expected_outputs": [
+                        {"canonical_path": "reviews/v1-form.json", "work_path": "w", "schema": "review"}
+                    ],
+                }
+            ],
+        }
+        row = {
+            "step_id": "s-020",
+            "kind": "dispatch",
+            "phase": "revision_loop",
+            "attempt": 1,
+            "reason": "initial",
+            "agents": [
+                {"slot": "form", "agent_type": "form-reviewer"},
+                {"slot": "logic", "agent_type": "logic-reviewer"},
+            ],
+        }
+        budget = machine.budget_for(state, row, ["form", "logic"])
+        self.assertEqual(1, machine.reviewer_failure_attempts(state, 1, "form"))
+        self.assertEqual(0, machine.reviewer_failure_attempts(state, 1, "logic"))
+        self.assertEqual(1, machine.budget_used(state, budget, "form"))
+        self.assertEqual(0, machine.budget_used(state, budget, "logic"))
+        # No `max()` across the kinds: `form` is out of budget, `logic` still has its own.
+        self.assertEqual(["logic"], machine.budget_slots_left(state, budget, ["form", "logic"]))
+
+
+class ReviewerJsonRetryTotalTest(unittest.TestCase):
+    """D-69: `MAX_REVIEWER_JSON_RETRY` is the total of both owners, counted in real dispatches."""
+
+    def test_a_failing_reviewer_is_dispatched_twice_before_the_stub(self):
+        driver = Driver(temp_root(self), slug="d69")
+        action = driver.run_until("revision_loop")
+        dispatches = []
+        while action.get("kind") == "dispatch":
+            dispatches.append(action)
+            for agent in action["agents"]:
+                driver.report(
+                    action["step_id"], action["attempt"], agent=agent["slot"], status="fail"
+                )
+            action = driver.next()
+
+        self.assertEqual(
+            1 + limits.MAX_REVIEWER_JSON_RETRY,
+            len(dispatches),
+            "the initial dispatch plus one JSON retry, never one per owner",
+        )
+        self.assertEqual(["initial", "failure"], [row["reason"] for row in dispatches])
+
+        # The aggregate that follows must stub the kinds instead of asking for a third dispatch.
+        self.assertEqual("script", action["kind"])
+        self.assertEqual("review.aggregate", machine.command_key(action["command"]))
+        driver.act(action)
+        result = machine.result_of(machine.step_row(driver.state(), action["step_id"], action["attempt"]))
+        self.assertEqual("revision_next", result["next"])
+        kinds = sorted(agent["slot"] for agent in dispatches[0]["agents"])
+        self.assertEqual(kinds, result["failed_reviewers"])
+        self.assertEqual(
+            [review.review_path(1, kind) for kind in kinds], sorted(result["stubs_written"])
+        )
+        attempts = driver.state()["attempts"]
+        self.assertEqual({}, attempts.get("reviewer_json_retry") or {})
+        self.assertEqual({}, attempts.get("reviewer_rerun") or {}, "a separate budget of §2.2")
+
+
+class OneModeApprovalTest(unittest.TestCase):
+    """D-242: approval always continues in Full, whatever an old answer names."""
+
+    def test_an_old_mode_answer_is_ignored(self):
+        applied = machine.apply_plan_answers({"config": {}}, {"Plan": "Approve", "Mode": "Brief"})
+        self.assertEqual("full", applied["mode"])
+        self.assertEqual(modes.resolve_config("full")["researcher_layers"], applied["config"]["researcher_layers"])
+        self.assertEqual("classical-memo", applied["config"]["template_id"])
+
+    def test_an_old_auq_answer_approves_the_run_as_full(self):
+        driver = Driver(temp_root(self), slug="one-mode-auq-answer")
+        gate = driver.run_until("plan_approval_pending")
+        answer = driver.report(
+            gate["step_id"],
+            gate["attempt"],
+            answers=json.dumps({"Plan": "Approve", "Mode": "Brief"}),
+            generation=gate.get("generation", 0),
+        )
+        self.assertTrue(answer["accepted"])
+        driver.run_until("research")
+        state = driver.state()
+        self.assertEqual("full", state["mode"])
+        self.assertEqual(["statutes", "case_law", "doctrine"], state["config"]["researcher_layers"])
+        self.assertEqual(modes.MODES["full"]["reviewer_list"], state["config"]["reviewer_list"])
+        self.assertEqual([], schema.validate(state, "state"))
+
+    def test_a_user_source_review_gate_survives_approval(self):
+        driver = Driver(temp_root(self), slug="one-mode-gate-off", user_config={"source_review_gate": "off"})
+        self.assertEqual("off", driver.state()["config"]["source_review_gate"])
+        driver.run_until("research")
+        self.assertEqual("off", driver.state()["config"]["source_review_gate"])
+        applied = machine.apply_plan_answers({"config": {"source_review_gate": "on"}}, {"Plan": "Approve"})
+        self.assertEqual("on", applied["config"]["source_review_gate"])
+
+
+class ForcedPlanApprovalModeTest(unittest.TestCase):
+    """D-70 / D-242: the forced approval of an edited plan continues with the Full config."""
+
+    def test_a_forced_approval_continues_in_full(self):
+        driver = Driver(temp_root(self), slug="d70")
+        gate = driver.run_until("plan_approval_pending")
+        driver.report(
+            gate["step_id"],
+            gate["attempt"],
+            answers=json.dumps({"Plan": "Edit: add the UK angle"}),
+            generation=gate.get("generation", 0),
+        )
+        answers = driver.state()["plan_approval"]["iterations"][-1]["answers"]
+        self.assertNotIn("Mode", answers, "the reply carries no Mode of its own")
+
+        def exhaust(current: dict) -> None:
+            current.setdefault("attempts", {})["plan_edit"] = limits.MAX_PLAN_EDIT + 1
+
+        state_io.write_state(driver.work_dir, exhaust)
+        driver.run_until("research")  # the edit is planned, then the plan is approved by force
+
+        state = driver.state()
+        self.assertEqual("full", state["mode"])
+        self.assertEqual(modes.MODES["full"]["reviewer_list"], state["config"]["reviewer_list"])
+        self.assertIn(
+            "plan_forced_approve", [banner["banner_id"] for banner in state["fallback_banners"]]
+        )
+
+
+class PolishFixRoundTest(unittest.TestCase):
+    """§2.1 row 14 / D-57: polish -> findings -> one writer fix -> checks -> readiness again."""
+
+    def _readiness_verdict(self, driver: Driver, action: dict, verdict: str) -> None:
+        agent = action["agents"][0]
+        target = driver.work_dir / agent["expected_outputs"][0]["work_path"]
+        document = probe.fixture_client_readiness(str(driver.state()["current_draft_sha"]), 1)
+        document["verdict"] = verdict
+        document["issues"] = [
+            {
+                "section_id": "s-3",
+                "severity": "minor",
+                "issue": "The conclusion could name the owner earlier.",
+                "suggestion": "Move the owner to the first sentence.",
+            }
+        ]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        state_io.write_json_atomic(target, document)
+        _agent_done(driver, action, agent["slot"])
+        driver.report(action["step_id"], action["attempt"], agent=agent["slot"])
+
+    def test_findings_after_the_polish_earn_one_fix_before_any_degradation(self):
+        driver = Driver(temp_root(self), slug="polish-fix")
+        readiness = driver.run_until("client_readiness")
+        self._readiness_verdict(driver, readiness, "needs_final_polish")
+
+        polish = driver.next()
+        self.assertEqual("dispatch", polish["kind"])
+        self.assertEqual(1, driver.state()["attempts"]["client_polish"])
+        _act_writer(driver, polish, edit=BREAK_RISK)  # the polish introduces an L-07 blocker
+
+        step = driver.next()
+        self.assertEqual("draft.finish", machine.command_key(step["command"]), step)
+        driver.act(step)
+        fix = driver.next()
+        self.assertEqual("dispatch", fix["kind"])
+        self.assertEqual("memo-writer", fix["agents"][0]["subagent_type"].split(":")[-1])
+        self.assertEqual(1, driver.state()["attempts"]["lint_fix"]["polish"])
+        self.assertEqual("client_readiness", driver.state()["current_phase"])
+        _act_writer(driver, fix, edit=(BREAK_RISK[1], BREAK_RISK[0]))
+
+        step = driver.next()
+        self.assertEqual("draft.finish", machine.command_key(step["command"]), step)
+        self.assertEqual("rerun", step["reason"])
+        driver.act(step)
+        again = driver.next()
+        self.assertEqual("dispatch", again["kind"])
+        self.assertEqual(
+            "client-readiness-reviewer", again["agents"][0]["subagent_type"].split(":")[-1]
+        )
+        self.assertNotIn("manual_review_required", str(driver.state().get("final_status")))
+
+        # Only now may the run degrade: `client_polish` and `lint_fix{polish}` are both spent.
+        self._readiness_verdict(driver, again, "needs_final_polish")
+        driver.next()
+        state = driver.state()
+        self.assertEqual("export", state["current_phase"])
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+        self.assertEqual(1, state["attempts"]["client_polish"])
+        self.assertEqual(1, state["attempts"]["lint_fix"]["polish"])
+
+
+class SkippedScriptStepTest(unittest.TestCase):
+    """§2.2/D-52: `skipped` closes a script step for good — only a CLI error (`fail`) does not."""
+
+    @staticmethod
+    def _docx(driver: Driver) -> Path:
+        state = driver.state()
+        return driver.work_dir / f"memo-{docx_export.slug_of(state, driver.work_dir)}.docx"
+
+    def test_the_export_walks_on_without_a_second_validation_step(self):
+        # D-117: `docx render` validated what it wrote, so the export goes straight to `finalize`
+        # and a docx removed afterwards no longer re-opens a validation step.
+        driver = Driver(temp_root(self), slug="skip-validate")
+        render = _drive_to_script(driver, "docx.render")
+        row = machine.step_row(driver.state(), render["step_id"], 1)
+        self.assertEqual("ok", row["status"])
+        self.assertTrue(row["result_ref"]["result"]["valid"])
+        self._docx(driver).unlink()
+
+        after = driver.next()
+        self.assertEqual("finalize", machine.command_key(after["command"]), after)
+        driver.act(after)
+        self.assertTrue(phases.is_terminal(driver.state()["current_phase"]))
+
+    def test_a_skipped_script_step_satisfies_its_phase(self):
+        """§2.2: every closed status but `fail` counts; `skipped` is a legitimate outcome."""
+        self.assertIn("skipped", machine.SCRIPT_DONE_STATUSES)
+        self.assertNotIn("fail", machine.SCRIPT_DONE_STATUSES)
+
+
+class RerunInputsTest(unittest.TestCase):
+    """§2.2: `reason: rerun` is the same action on **changed** inputs — `inputs_sha` decides (D-58)."""
+
+    def test_a_closed_step_with_unchanged_inputs_is_not_re_issued(self):
+        driver = Driver(temp_root(self), slug="rerun-inputs")
+        render = _drive_to_script(driver, "docx.render")
+        state = driver.state()
+        sha = machine.export_draft_sha(state)[0]
+        inputs = machine.export_inputs(driver.work_dir, state, sha)
+        row = machine.step_row(state, render["step_id"], 1)
+        self.assertEqual("ok", row["status"])
+        self.assertEqual(machine.inputs_sha(driver.work_dir, inputs), row["inputs_sha"])
+
+        again = machine.script_step(
+            driver.work_dir,
+            state,
+            "docx",
+            "render",
+            chat="rendering again",
+            extra=("--draft-sha", str(sha or "")),
+            inputs=inputs,
+        )
+        self.assertIsNone(again, "unchanged inputs are no reason to re-issue a closed step")
+        self.assertEqual(1, len(stepctx.steps_for(driver.state(), render["step_id"])))
+
+    def test_a_changed_input_sha_earns_the_rerun(self):
+        driver = Driver(temp_root(self), slug="rerun-changed")
+        render = _drive_to_script(driver, "docx.render")
+        state = driver.state()
+        sha = machine.export_draft_sha(state)[0]
+        inputs = machine.export_inputs(driver.work_dir, state, sha)
+        target = driver.work_dir / inputs[0]
+        target.write_bytes(target.read_bytes() + b"\n")
+
+        rerun = machine.script_step(
+            driver.work_dir,
+            driver.state(),
+            "docx",
+            "render",
+            chat="rendering again",
+            extra=("--draft-sha", str(sha or "")),
+            inputs=inputs,
+        )
+        self.assertIsNotNone(rerun)
+        self.assertEqual(render["step_id"], rerun["step_id"])
+        self.assertEqual(2, rerun["attempt"])
+        self.assertEqual("rerun", rerun["reason"])
+
+    def test_a_step_issued_too_often_leaves_through_finalize(self):
+        # D-58: whatever keeps a step repeating, the run exits instead of spinning.
+        driver = Driver(temp_root(self), slug="step-loop")
+        driver.run_until("research")
+        work_dir = driver.work_dir
+        step_id = machine.next_step_id(driver.state())
+        spec = {"kind": machine.KIND_SCRIPT, "command": ["mf", "draft", "lint"], "chat_line": "loop"}
+        for attempt in range(1, limits.MAX_STEP_ATTEMPTS + 1):
+            issued = machine.issue(
+                work_dir, driver.state(), dict(spec), step_id=step_id, attempt=attempt
+            )
+            self.assertEqual(step_id, issued["step_id"], attempt)
+
+        exit_step = machine.issue(
+            work_dir, driver.state(), dict(spec), step_id=step_id, attempt=limits.MAX_STEP_ATTEMPTS + 1
+        )
+        self.assertEqual("script", exit_step["kind"])
+        self.assertEqual("finalize", machine.command_key(exit_step["command"]))
+        self.assertIn(machine.STEP_LOOP, exit_step["command"])
+        self.assertEqual(
+            limits.MAX_STEP_ATTEMPTS, len(stepctx.steps_for(driver.state(), step_id))
+        )
+
+        machine.run_command(list(exit_step["command"]))
+        state = driver.state()
+        self.assertTrue(phases.is_terminal(state["current_phase"]))
+        self.assertIn(machine.STEP_LOOP, state["final_status_reasons"])
+
+
+class StepClosingTest(unittest.TestCase):
+    """D-40: `stepctx.close_step` is the only implementation of the step protocol."""
+
+    def test_machine_has_no_close_of_its_own(self):
+        self.assertFalse(hasattr(machine, "close"))
+
+    def test_closing_a_superseded_attempt_is_refused_under_the_lock(self):
+        driver = Driver(temp_root(self), slug="d40")
+        action = driver.run_until("research")
+        stale = machine.step_row(driver.state(), action["step_id"], action["attempt"])
+        driver.next()  # attempt 2 is the issued identity now
+        with self.assertRaises(stepctx.IdentityMismatch):
+            machine.close_step(driver.work_dir, stale, {"slots": {}}, status="ok")
+
+
+class AgentLogTest(unittest.TestCase):
+    """§3.1: `mf agent log --state done` writes the completion marker the checks read."""
+
+    def test_done_marker_matches_the_declared_inputs(self):
+        driver = Driver(temp_root(self), slug="marker")
+        action = driver.run_until("research")
+        agent = action["agents"][0]
+        step = {"step_id": action["step_id"], "attempt": action["attempt"]}
+        probe.run_fixture_agent(driver.work_dir, driver.state(), step, agent)
+        marker = state_io.read_json(
+            machine.marker_path(driver.work_dir, action["step_id"], action["attempt"], agent["slot"])
+        )
+        declared = machine.step_row(driver.state(), action["step_id"], action["attempt"])["inputs"]
+        self.assertEqual(declared, marker["input_sha"])
+        self.assertIn(agent["expected_outputs"][0]["work_path"], marker["output_sha"])
+
+    def test_missing_marker_is_a_failed_completion(self):
+        driver = Driver(temp_root(self), slug="nomarker")
+        action = driver.run_until("research")
+        answer = driver.report(action["step_id"], action["attempt"], agent="statutes")
+        self.assertFalse(answer["accepted"])
+        self.assertIn("missing_done_marker", answer["errors"])
+        self.assertEqual(action["step_id"], answer["retry"]["step_id"])
+
+
+class McpProbePromptTest(unittest.TestCase):
+    """D-105: the inline probe names every bundled server and every key of `mcp-probe`."""
+
+    def instruction(self) -> str:
+        driver = Driver(temp_root(self), slug="probeprompt")
+        action = driver.run_until("intake_preliminary_research")
+        self.assertEqual("inline-llm", action["kind"])
+        return action["instruction"]
+
+    def test_the_probe_names_all_four_bundled_servers(self):
+        text = self.instruction()
+        for name in ("Legal Data Hunter", "CourtListener", "LegalViz", "eurlex", "UK Legal", "uk-legal-mcp"):
+            self.assertIn(name, text, name)
+        self.assertIn("any other legal server", text)
+
+    def test_the_probe_names_every_namespace_key_of_the_schema(self):
+        text = self.instruction()
+        properties = json.loads(
+            (PLUGIN_ROOT / "schemas" / "mcp-probe.schema.json").read_text(encoding="utf-8-sig")
+        )["properties"]["namespaces"]["properties"]
+        for key in properties:
+            self.assertIn(f'"{key}"', text, key)
+
+    def test_the_probe_asks_for_one_live_call_per_connected_server(self):
+        """D-147: listing a namespace is not evidence; the LDH quota died on call 2 in the real run."""
+        text = self.instruction()
+        self.assertIn('resolve("Regulation (EU) 2016/679")', text)
+        self.assertIn('legislation_search("Data Protection Act 2018", limit 1)', text)
+        self.assertIn('discover_sources("EU")', text)
+        self.assertIn("`search`", text)
+        self.assertIn('"status"', text)
+        for verdict in ("ok", "quota", "auth", "error", "absent"):
+            self.assertIn(verdict, text, verdict)
+        self.assertNotIn("Do not call the servers", text)
+
+
+class PreflightStepTest(unittest.TestCase):
+    """D-147: `planning` publishes `plan.json`, then probes the portals, then opens gate 4."""
+
+    def steps(self, driver: Driver) -> list[str]:
+        return [machine.purpose(row) for row in driver.state()["steps"] if row.get("phase") == "planning"]
+
+    def test_the_preflight_runs_after_the_plan_and_before_the_gate(self):
+        driver = Driver(temp_root(self), slug="preflight-order")
+        action = driver.run_until("planning")
+        self.assertEqual("inline-llm", action["kind"])
+        driver.act(action)
+
+        step = driver.next()
+        self.assertEqual("script", step["kind"])
+        self.assertEqual("sources.preflight", machine.command_key(step["command"]))
+        self.assertEqual("planning", step["phase"])
+        self.assertTrue((driver.work_dir / "plan.json").is_file(), "the plan is published first")
+        driver.act(step)
+
+        gate = driver.next()
+        self.assertEqual("gate-auq", gate["kind"])
+        self.assertEqual("plan_approval_pending", gate["phase"])
+        self.assertEqual(["inline:plan.json", "script:sources.preflight"], self.steps(driver))
+        self.assertTrue((driver.work_dir / preflight.PREFLIGHT_PATH).is_file())
+
+    def test_a_plan_edit_re_runs_the_preflight_on_the_new_plan(self):
+        """§2.2 `reason: rerun`: the corrected plan may name another jurisdiction."""
+        driver = Driver(temp_root(self), slug="preflight-edit")
+        gate = driver.run_until("plan_approval_pending")
+        driver.report(gate["step_id"], gate["attempt"], answers=json.dumps({"Plan": "Edit"}),
+                      generation=gate.get("generation", 0))
+        driver.act(driver.run_until("planning"))
+        # The planner rewrote `plan.json`; the sha of the declared input changed with it.
+        state_io.write_json_atomic(
+            driver.work_dir / "plan.json", dict(probe.fixture_plan(), jurisdictions=["UK"])
+        )
+        step = driver.next()
+        self.assertEqual("sources.preflight", machine.command_key(step["command"]))
+        self.assertEqual("rerun", machine.step_row(driver.state(), step["step_id"], step["attempt"])["reason"])
+
+    def test_the_researcher_is_told_what_did_not_answer(self):
+        driver = Driver(temp_root(self), slug="preflight-prompt")
+        driver.run_until("plan_approval_pending")
+        specs = machine.researcher_specs(driver.work_dir, driver.state(), ["statutes"])
+        self.assertEqual(
+            preflight.CLEAN_LINE, specs[0]["extra"]["source_access"], "the offline run answered ok"
+        )
+        self.assertIn(preflight.PREFLIGHT_PATH, specs[0]["inputs"])
+
+
+class McpSmokeStatusTest(unittest.TestCase):
+    """D-147: a connected server whose smoke call failed is dropped like an exhausted quota (D-122)."""
+
+    def test_a_failed_server_leaves_the_routing_digest_of_the_analyst(self):
+        driver = Driver(temp_root(self), slug="smoke-status")
+        action = driver.run_until("intake_preliminary_research")
+        target = driver.work_dir / action["write_to"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        state_io.write_json_atomic(
+            target,
+            dict(
+                probe.fixture_mcp_probe(),
+                status={"ldh": "quota", "courtlistener": "ok", "legalviz": "error", "uklegal": "ok"},
+            ),
+        )
+        driver.report(action["step_id"], action["attempt"])
+        analyst = driver.next()
+        self.assertEqual("dispatch", analyst["kind"])
+        prompt = analyst["agents"][0]["prompt"]
+        digest = prompt.split("(statutes / case law):", 1)[1].split("## Write", 1)[0]
+        self.assertNotIn("ldh_", digest, "a spent quota is not offered")
+        self.assertNotIn("legalviz_", digest, "a server that failed its smoke call is not offered")
+        self.assertIn("uklegal_legislation_search", digest)
+        self.assertIn("courtlistener_search", digest)
+
+    def test_a_probe_without_status_still_offers_every_connected_server(self):
+        usable = machine.preflight.usable_namespaces(probe.fixture_mcp_probe() | {"status": {}})
+        self.assertIn("ldh", usable)
+
+
+class SlotTimingTest(unittest.TestCase):
+    """D-120: `agent_returned` measures the slot, not the round trip around it."""
+
+    @staticmethod
+    def _log(driver: Driver, action: dict, slot: str, state: str) -> None:
+        machine.run_agent_log(
+            namespace(
+                workdir=str(driver.work_dir),
+                step=action["step_id"],
+                attempt=action["attempt"],
+                slot=slot,
+                state=state,
+                detail=None,
+                mcp=None,
+            )
+        )
+
+    @staticmethod
+    def _returned(driver: Driver) -> list[dict]:
+        return [
+            row["data"]
+            for row in events.read_events(driver.work_dir)
+            if row["event"] == "agent_returned"
+        ]
+
+    def test_the_duration_is_the_slot_window_and_the_lags_are_their_own_fields(self):
+        driver = Driver(temp_root(self), slug="timing")
+        action = driver.run_until("research")
+        slot = action["agents"][0]["slot"]
+        self._log(driver, action, slot, "start")
+        probe.run_fixture_agent(driver.work_dir, driver.state(), action, action["agents"][0])
+        driver.report(action["step_id"], action["attempt"], agent=slot)
+
+        data = self._returned(driver)[-1]
+        self.assertEqual(slot, data["slot"])
+        for field in ("duration_seconds", "queue_s", "barrier_s"):
+            self.assertIsNotNone(data[field], field)
+            self.assertGreaterEqual(data[field], 0.0)
+        issued = machine.step_row(driver.state(), action["step_id"], action["attempt"])["issued_at"]
+        total = (
+            machine._stamp(events.utc_now()) - machine._stamp(issued)
+        ).total_seconds()
+        parts = data["queue_s"] + data["duration_seconds"] + data["barrier_s"]
+        self.assertLessEqual(parts, total + 0.5, data)
+
+    def test_without_a_start_event_the_old_value_stands_and_the_queue_is_null(self):
+        driver = Driver(temp_root(self), slug="timing-fallback")
+        action = driver.run_until("research")
+        agent = action["agents"][0]
+        # The fixture agent logs only `done`, the way an agent that forgot its first Bash call would.
+        probe.run_fixture_agent(driver.work_dir, driver.state(), action, agent)
+        driver.report(action["step_id"], action["attempt"], agent=agent["slot"])
+
+        data = self._returned(driver)[-1]
+        self.assertIsNotNone(data["duration_seconds"], "the issue -> report value is the fallback")
+        self.assertIsNone(data["queue_s"], "no `start` event, no measurable queue")
+        self.assertIsNotNone(data["barrier_s"])
+
+
+class TerminalProgressTest(unittest.TestCase):
+    """D-121: «0 of 12» at the end of a finished run reads as a broken counter."""
+
+    def test_a_terminal_phase_puts_the_position_at_the_denominator(self):
+        driver = Driver(temp_root(self), slug="terminal-progress")
+        driver.run_to_end()
+        progress = driver.state()["progress"]
+        self.assertTrue(phases.is_terminal(driver.state()["current_phase"]))
+        self.assertEqual(progress["total"], progress["position"])
+        self.assertEqual(len(progress["route"]), progress["position"])
+
+    def test_a_live_phase_still_counts_from_one(self):
+        driver = Driver(temp_root(self), slug="live-progress")
+        driver.run_until("research")
+        progress = driver.state()["progress"]
+        self.assertLess(progress["position"], progress["total"])
+        self.assertGreater(progress["position"], 0)
+
+
+class McpExhaustionTest(unittest.TestCase):
+    """D-122: a provider that says «quota exhausted» is off the routing table for the day."""
+
+    def _driver(self, slug: str) -> Driver:
+        return Driver(temp_root(self), slug=slug)
+
+    @staticmethod
+    def _fallback(driver: Driver, **data) -> None:
+        events.append_event(driver.work_dir, "mcp_ratelimit_fallback", "statutes", data)
+
+    def test_a_quota_note_records_the_alias_with_today_s_date(self):
+        driver = self._driver("exhausted")
+        self._fallback(
+            driver,
+            server="Legal_Data_Hunter",
+            retry_after=None,
+            note="daily free-plan quota exhausted after 2 resolve_reference calls",
+        )
+        merged = machine.record_mcp_exhaustion(driver.work_dir, driver.state())
+        self.assertEqual({"ldh": events.utc_now()[:10]}, merged)
+        self.assertEqual(merged, driver.state()["mcp_exhausted"])
+        self.assertEqual(("ldh",), machine.mcp_exhausted_today(driver.state()))
+
+    def test_a_plain_throttle_is_not_an_exhaustion(self):
+        driver = self._driver("throttled")
+        self._fallback(driver, server="ldh", retry_after=30, note="rate limited, retry shortly")
+        self.assertEqual({}, machine.record_mcp_exhaustion(driver.work_dir, driver.state()))
+        self.assertEqual((), machine.mcp_exhausted_today(driver.state()))
+
+    def test_the_alias_is_matched_however_the_agent_spelled_the_server(self):
+        for name in ("ldh", "Legal Data Hunter", "legal-data-hunter", "LEGAL_DATA_HUNTER"):
+            with self.subTest(server=name):
+                self.assertEqual("ldh", machine._exhaustion_alias(name))
+        self.assertEqual("uklegal", machine._exhaustion_alias("uk-legal"))
+        self.assertEqual("legalviz", machine._exhaustion_alias("LegalViz"))
+        self.assertIsNone(machine._exhaustion_alias("some other server"))
+
+    def test_yesterday_s_exhaustion_no_longer_filters_the_digest(self):
+        driver = self._driver("exhausted-yesterday")
+
+        def mutate(state: dict) -> None:
+            state["mcp_exhausted"] = {"ldh": "2000-01-01"}
+
+        state_io.write_state(driver.work_dir, mutate)
+        self.assertEqual((), machine.mcp_exhausted_today(driver.state()))
+
+    def test_the_exhausted_server_leaves_the_routing_digest(self):
+        from memoforge import routing
+
+        connected = {"ldh": "mcp__x__", "courtlistener": "mcp__y__"}
+        before = routing.routing_digest(connected)
+        after = routing.routing_digest(connected, exhausted=("ldh",))
+        self.assertIn("ldh_", before)
+        self.assertNotIn("ldh_", after)
+        self.assertIn("courtlistener", after)
+        self.assertEqual(len(before.splitlines()), len(after.splitlines()))
+
+    def test_the_ldh_daily_ceiling_matches_what_the_provider_really_allows(self):
+        self.assertEqual(10, limits.MCP_PROVIDER_DAILY_LIMITS["ldh"])
+
+
+class KnownBlockersTest(unittest.TestCase):
+    """D-119: the readiness reviewer is told what the review loop already wrote down."""
+
+    SHA = "b" * 64
+    ISSUES = [
+        {"section_id": "s-2", "category": "unsupported_claim", "severity": "blocker",
+         "issue": "Article 17(1) is quoted without the rule it is said to carry."},
+        {"section_id": "s-3", "category": "missing_counterargument", "severity": "blocker",
+         "issue": "The one-stop-shop mechanism of Article 56 is never addressed."},
+    ]
+
+    def _state(self, *, aggregated_sha: str, draft_sha: str) -> dict:
+        return {
+            "remaining_blocking_issues": list(self.ISSUES),
+            "iterations": [{"iteration": 1, "draft_sha": aggregated_sha}],
+            "current_draft_sha": draft_sha,
+        }
+
+    def test_the_blockers_of_this_very_draft_are_handed_over(self):
+        text = machine.known_blockers_text(self._state(aggregated_sha=self.SHA, draft_sha=self.SHA), self.SHA)
+        self.assertIn("2 blocking issue(s)", text)
+        self.assertIn("NEW", text)
+        self.assertIn("Article 17(1)", text)
+        self.assertIn("s-3 · missing_counterargument", text)
+
+    def test_a_draft_the_aggregate_never_saw_hands_over_nothing(self):
+        state = self._state(aggregated_sha="c" * 64, draft_sha=self.SHA)
+        self.assertEqual(machine.KNOWN_BLOCKERS_NONE, machine.known_blockers_text(state, self.SHA))
+
+    def test_a_run_without_blockers_hands_over_nothing(self):
+        self.assertEqual(machine.KNOWN_BLOCKERS_NONE, machine.known_blockers_text({}, self.SHA))
+
+    def test_the_readiness_dispatch_carries_the_extra(self):
+        driver = Driver(temp_root(self), slug="known-blockers")
+        action = driver.run_until("client_readiness")
+        self.assertIn("already known blockers: none", action["agents"][0]["prompt"])
+
+    def test_the_prompt_repeats_the_aggregated_blockers_when_there_are_some(self):
+        driver = Driver(temp_root(self), slug="known-blockers-live")
+        action = driver.run_until("client_readiness")
+
+        def mutate(state: dict) -> None:
+            state["remaining_blocking_issues"] = list(self.ISSUES)
+            state["iterations"] = [
+                dict(row, draft_sha=state.get("current_draft_sha"))
+                for row in (state.get("iterations") or [{"iteration": 1}])
+            ]
+
+        state_io.write_state(driver.work_dir, mutate)
+        state = driver.state()
+        text = machine.known_blockers_text(state, str(machine.current_draft_sha(state) or ""))
+        self.assertIn("Article 17(1)", text)
+        self.assertIn("NEW", text)
+        self.assertNotEqual(machine.KNOWN_BLOCKERS_NONE, text)
+        self.assertIsNotNone(action)
+
+
+class ReadinessWarningsTest(unittest.TestCase):
+    """D-238: readiness grades CRD-03 on the run's warnings, so its spec carries them."""
+
+    def test_the_readiness_spec_carries_the_run_s_warning(self):
+        message = "Позиции КС РФ о ст. 428 ГК РФ (№ 14-П, № 34-П) в исследовании не проанализированы."
+        state = {
+            "config": {"max_client_polish": 1},
+            "current_phase": "client_readiness",
+            "drafting_warnings": [
+                {"code": "unresolved_research_gap", "message": message, "phase": "research_sufficiency"}
+            ],
+        }
+        with mock.patch.object(machine, "issue_dispatch", return_value={}) as issued:
+            machine._dispatch_readiness(temp_root(self), state, "drafts/v2.md", 2)  # noqa: SLF001
+        spec = issued.call_args.args[2][0]
+        self.assertEqual("client_readiness", spec["slot"])
+        self.assertEqual(message, spec["extra"]["drafting_warnings"])
+
+
+class CurrencyNotesTest(unittest.TestCase):
+    """D-241: the checker judges a change against the facts, and readiness checks its note reaches the memo."""
+
+    NOTE = "290-ФЗ меняет пп. 1, 4, 6 ст. 13 с 01.10.2026; п. 6 (штраф) — в используемой части."
+
+    def test_the_currency_spec_declares_the_plan_and_the_user_facts(self):
+        state = {"current_phase": "currency_check", "steps": []}
+        with mock.patch.object(machine, "script_done", return_value={"status": "ok"}), \
+                mock.patch.object(machine, "issue_dispatch", return_value={}) as issued:
+            machine.plan_currency_check(temp_root(self), state)
+        spec = issued.call_args.args[2][0]
+        self.assertEqual("currency-checker", spec["agent"])
+        for path in ("research/sources.json", gates.PLAN_PATH, gates.USER_FACTS_PATH):
+            with self.subTest(path=path):
+                self.assertIn(path, spec["inputs"])
+
+    def _readiness(self, draft: str, rows: list[dict]) -> dict:
+        work_dir = temp_root(self)
+        (work_dir / "drafts").mkdir(parents=True, exist_ok=True)
+        (work_dir / "drafts" / "v2.md").write_text(draft, encoding="utf-8")
+        state_io.write_json_atomic(
+            work_dir / sources.CURRENCY_PATH,
+            {"checked_at": "2026-09-23", "sources": rows, "blocking": [], "warnings": []},
+        )
+        state = {"config": {"max_client_polish": 1}, "current_phase": "client_readiness", "language": "ru"}
+        with mock.patch.object(machine, "issue_dispatch", return_value={}) as issued:
+            machine._dispatch_readiness(work_dir, state, "drafts/v2.md", 2)  # noqa: SLF001
+        return issued.call_args.args[2][0]
+
+    def test_readiness_lists_the_note_of_a_cited_source_only(self):
+        draft = (
+            "## 4. Анализ\n\n"
+            "Потребитель вправе требовать неустойку [[src:ru-zozpp-13 п. 6 ст. 13]].\n\n"
+            "Хранитель отвечает за утрату вещи [[src:ru-gk-902 п. 1 ст. 902]].\n"
+        )
+        rows = [
+            {"source_id": "ru-zozpp-13", "status": "current", "note": self.NOTE},
+            {"source_id": "ru-gk-902", "status": "current", "note": ""},
+            {"source_id": "ru-uncited", "status": "manual_check", "note": "Не цитируется в черновике."},
+        ]
+        spec = self._readiness(draft, rows)
+        self.assertEqual(f"ru-zozpp-13 · current · {self.NOTE}", spec["extra"]["currency_notes"])
+
+    def test_two_rows_of_one_cited_source_give_two_lines_in_file_order(self):
+        # Fix round 1 (Sol): a map keyed by `source_id` kept only the last row, so the earlier note was lost.
+        later = "Постановление КС № 7-П от 2026-03-05 — в используемой части не меняет."
+        rows = [
+            {"source_id": "ru-zozpp-13", "status": "current", "note": self.NOTE},
+            {"source_id": "ru-zozpp-13", "status": "current", "note": later},
+        ]
+        spec = self._readiness("Неустойка [[src:ru-zozpp-13 п. 6 ст. 13]].\n", rows)
+        self.assertEqual(
+            f"ru-zozpp-13 · current · {self.NOTE}\nru-zozpp-13 · current · {later}", spec["extra"]["currency_notes"]
+        )
+
+    def test_readiness_gets_none_when_no_cited_source_carries_a_note(self):
+        rows = [{"source_id": "ru-gk-902", "status": "current", "note": "  "}]
+        spec = self._readiness("Хранитель отвечает [[src:ru-gk-902 п. 1 ст. 902]].\n", rows)
+        self.assertEqual("none", spec["extra"]["currency_notes"])
+
+    def test_the_default_of_a_re_render_is_none(self):
+        self.assertEqual("none", machine.dispatch._DEFAULT_EXTRAS["currency_notes"])  # noqa: SLF001
+
+
+# --- D-211: the last reader acts on the open substantive majors ------------------------------
+
+
+def _major(row_id: str, klass: str, section_id: str = "s-3", **overrides) -> dict:
+    """One `open_substance_majors` row, shaped as `review.open_substance_majors` writes it (D-210)."""
+    row = {
+        "id": row_id,
+        "class": klass,
+        "reviewer": klass,
+        "section_id": section_id,
+        "category": "pinpoint_mismatch" if klass == "citations" else "overstated_recourse",
+        "issue_category": "source_drift" if klass == "citations" else None,
+        "issue": f"The retention rule in {section_id} is stated more firmly than its source allows ({row_id}).",
+        "issue_client": None,
+        "suggestion": "Soften the statement or withdraw it.",
+        "from_iteration": 1,
+        "origin": "loop",
+        "status": "open",
+    }
+    row.update(overrides)
+    return row
+
+
+SOFTEN_S3 = {
+    "section_id": "s-3",
+    "severity": "major",
+    "issue": "The retention rule is stated more firmly than the source allows.",
+    "suggestion": "Soften the statement of the rule; add no new statement of law and no new authority.",
+}
+"""The readiness issue a `polish` disposition of a row in s-3 turns into (D-211)."""
+
+OUT_OF_SCOPE_EDIT = (
+    "The client keeps customer records for seven years. We assume",
+    "The client keeps customer records for seven years under its own policy. We assume",
+)
+"""A polish edit in s-2 (facts), which no readiness issue names and which is no cross-reference section."""
+
+RECHECK_BLOCKER = {
+    "severity": "blocker",
+    "category": "unsupported_law",
+    "section_id": "s-3",
+    "issue": "The polished sentence still states a rule the cited article does not contain.",
+    "suggestion": "Withdraw the rule or mark it as unresolved.",
+    "checklist_id": "CIT-01",
+    "issue_category": "unsupported_claim",
+    "issue_client": "Норма, изложенная в разделе 3, не подтверждается указанной статьёй.",
+}
+"""A blocker the citations re-check of the polish raises in s-3 (D-211)."""
+
+
+def _to_readiness(case, slug: str, rows: list[dict], *, language: str = "en") -> tuple:
+    """Drive a run to its first client-readiness dispatch with `rows` as the loop's open majors."""
+    driver = Driver(temp_root(case), slug=slug)
+    if language != "en":
+        state_io.write_state(driver.work_dir, lambda current: current.update({"language": language}))
+    with mock.patch.object(review, "open_substance_majors", side_effect=lambda *_: copy.deepcopy(rows)):
+        action = driver.run_until("client_readiness")
+    return driver, action
+
+
+def _answer(driver: Driver, action: dict, document: dict) -> dict:
+    """Write `document` as the slot's output, mark it done and report it."""
+    agent = action["agents"][0]
+    target = driver.work_dir / agent["expected_outputs"][0]["work_path"]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    state_io.write_json_atomic(target, document)
+    _agent_done(driver, action, agent["slot"])
+    return driver.report(action["step_id"], action["attempt"], agent=agent["slot"])
+
+
+def _readiness_document(driver: Driver, verdict: str, *, issues=(), dispositions=None) -> dict:
+    state = driver.state()
+    document = probe.fixture_client_readiness(
+        str(machine.current_draft_sha(state)), int(state["current_iteration"])
+    )
+    document["verdict"] = verdict
+    document["issues"] = [dict(issue) for issue in issues]
+    if dispositions is not None:
+        document["dispositions"] = [
+            {"id": row_id, "action": action, "note": "Fixture disposition."} for row_id, action in dispositions
+        ]
+    return document
+
+
+def _recheck_document(driver: Driver, *, resolutions=(), issues=(), unknown=(), failed=()) -> dict:
+    """A `citations` review of the post-polish draft, as the re-check agent writes it."""
+    state = driver.state()
+    document = probe.fixture_review(
+        "citations", str(machine.current_draft_sha(state)), int(state["current_iteration"])
+    )
+    for item in document["checklist"]:
+        if item["id"] in unknown:
+            item["pass"] = "unknown"
+        if item["id"] in failed:
+            item["pass"] = False
+    document["issues"] = [dict(issue) for issue in issues]
+    if any(issue["severity"] == "blocker" for issue in issues):
+        document["verdict"] = "needs_revision"
+    if resolutions:
+        document["resolutions"] = [
+            {"id": row_id, "status": status, "note": "Fixture resolution."} for row_id, status in resolutions
+        ]
+    return document
+
+
+def _next_dispatch_of(driver: Driver, agent: str, *, limit: int = 10) -> dict:
+    """Advance, acting on everything else, until `next` dispatches `agent`; that action is not acted on."""
+    for _ in range(limit):
+        action = driver.next()
+        if action.get("errors"):
+            raise AssertionError(f"next failed: {action['errors']}")
+        if action["kind"] == "dispatch" and action["agents"][0]["subagent_type"].endswith(agent):
+            return action
+        if action["kind"] == "terminal":
+            raise AssertionError(f"the run ended before {agent} was dispatched")
+        driver.act(action)
+    raise AssertionError(f"{agent} was never dispatched")
+
+
+def _to_recheck(case, slug: str, rows: list[dict], *, dispositions, language: str = "en") -> tuple:
+    """Pass 1 asks for the polish, the fixture writer edits s-3, and the run stops on the re-check."""
+    driver, first = _to_readiness(case, slug, rows, language=language)
+    _answer(
+        driver,
+        first,
+        _readiness_document(driver, "needs_final_polish", issues=[SOFTEN_S3], dispositions=dispositions),
+    )
+    polish = driver.next()
+    if not polish["agents"][0]["subagent_type"].endswith("memo-writer"):
+        raise AssertionError(f"no polish dispatch: {polish}")
+    _act_writer(driver, polish)
+    return driver, _next_dispatch_of(driver, "citation-auditor")
+
+
+def _phase_purposes(state: dict, phase: str) -> list[str]:
+    """The purpose of every step issued in `phase`, one per step id, in issue order."""
+    seen: list[str] = []
+    purposes: list[str] = []
+    for row in state.get("steps") or []:
+        if row.get("phase") == phase and row["step_id"] not in seen:
+            seen.append(row["step_id"])
+            purposes.append(machine.purpose(row))
+    return purposes
+
+
+def _row(state: dict, row_id: str) -> dict:
+    return next(row for row in state["open_substance_majors"] if row["id"] == row_id)
+
+
+def _finding_line(row: dict) -> str:
+    return f"- {row['id']} · {row['class']} · {row['section_id']} · {row['issue']} · {row['suggestion']}"
+
+
+PREPOLISH_V1 = "reviews/v1-prepolish.md"
+
+
+class OpenMajorsReadinessTest(unittest.TestCase):
+    """D-211: the readiness reviewer disposes of the open majors; the polish is kept in scope and re-checked."""
+
+    def test_an_empty_list_leaves_the_readiness_steps_as_they_were(self):
+        driver = Driver(temp_root(self), slug="om-empty")
+        first = driver.run_until("client_readiness")
+        self.assertIn("## Open reviewer findings\n\nnone\n", first["agents"][0]["prompt"])
+        _answer(driver, first, _readiness_document(driver, "needs_final_polish", issues=[SOFTEN_S3]))
+        driver.run_to_end()
+        state = driver.state()
+        self.assertEqual(
+            [
+                "dispatch:client-readiness-reviewer",
+                "dispatch:memo-writer",
+                "script:draft.finish",
+                "dispatch:client-readiness-reviewer",
+            ],
+            _phase_purposes(state, "client_readiness"),
+        )
+        self.assertEqual("approved_on_v1", state["final_status"])
+        for field in ("polish_check", "export_pin"):
+            self.assertNotIn(field, state)
+        self.assertIsNone(stepctx.published_entry(state, PREPOLISH_V1))
+        self.assertFalse((driver.work_dir / PREPOLISH_V1).exists())
+
+    def test_the_polish_recheck_carries_no_pairs_over(self):
+        """D-214 (gate R1-7): `citations_polish` takes its base from `reviewer_specs` and overrides `carry_over`."""
+        pair = [{"source_id": "src-carried", "section_id": "s-3", "reason": "not_reached"}]
+        rows = [_major("om-1", "citations")]
+        with mock.patch.object(review, "unchecked_pairs", return_value=pair):
+            driver, recheck = _to_recheck(self, "om-carry", rows, dispositions=[("om-1", "polish")])
+            base = machine.reviewer_specs(driver.work_dir, driver.state(), ["citations"], 1)[0]
+        self.assertEqual("src-carried · s-3 · not_reached", base["extra"]["carry_over"])
+        agent = recheck["agents"][0]
+        self.assertEqual("citations_polish", agent["slot"])
+        prompt = " ".join(agent["prompt"].split())
+        self.assertIn("nothing is carried over). none 2. Every statement", prompt)
+        self.assertNotIn("src-carried", prompt)
+
+    def test_a_polished_citations_row_the_recheck_resolves_keeps_the_approval(self):
+        rows = [_major("om-1", "citations")]
+        driver, first = _to_readiness(self, "om-resolved", rows)
+        line = _finding_line(rows[0])
+        self.assertIn(line + "\n", first["agents"][0]["prompt"])
+        baseline = (driver.work_dir / "drafts/v1.md").read_bytes()
+        _answer(
+            driver,
+            first,
+            _readiness_document(driver, "needs_final_polish", issues=[SOFTEN_S3], dispositions=[("om-1", "polish")]),
+        )
+
+        polish = driver.next()
+        self.assertTrue(polish["agents"][0]["subagent_type"].endswith("memo-writer"))
+        state = driver.state()
+        entry = stepctx.published_entry(state, PREPOLISH_V1)
+        self.assertEqual(
+            (state_io.sha256_bytes(baseline), "command", polish["step_id"]),
+            (entry["sha256"], entry["by"], entry["step_id"]),
+        )
+        self.assertEqual(baseline, (driver.work_dir / PREPOLISH_V1).read_bytes())
+        self.assertEqual("open", _row(state, "om-1")["status"])
+        _act_writer(driver, polish)  # the fixture writer rewrites one sentence of s-3
+
+        finish = driver.next()
+        self.assertEqual("draft.finish", machine.command_key(finish["command"]))
+        state = driver.state()
+        self.assertEqual({"draft_sha": machine.current_draft_sha(state), "errors": []}, state["polish_check"])
+        driver.act(finish)
+
+        recheck = driver.next()
+        agent = recheck["agents"][0]
+        self.assertEqual(("citations_polish", "memoforge:citation-auditor"), (agent["slot"], agent["subagent_type"]))
+        self.assertEqual("reviews/v1-citations_polish.json", agent["expected_outputs"][0]["canonical"])
+        self.assertIn(
+            f"Scope: sections s-3; the open findings om-1 · citations · {rows[0]['issue']} were polished. "
+            "Grade CIT-01/02/04 on these sections. Record one `resolutions` row per listed id.",
+            agent["prompt"],
+        )
+        self.assertIn("Lookup budget: 20 units", agent["prompt"])
+        _answer(driver, recheck, _recheck_document(driver, resolutions=[("om-1", "resolved")]))
+
+        second = driver.next()
+        self.assertTrue(second["agents"][0]["subagent_type"].endswith("client-readiness-reviewer"))
+        # The list reaches the second pass although the draft sha moved, each row with its status.
+        self.assertNotEqual(state_io.sha256_bytes(baseline), driver.state()["current_draft_sha"])
+        self.assertIn(line + " · status: resolved", second["agents"][0]["prompt"])
+        driver.act(second)  # the fixture reviewer answers `client_ready`
+        driver.run_to_end()
+
+        state = driver.state()
+        self.assertEqual("approved_on_v1", state["final_status"])
+        self.assertEqual("resolved", _row(state, "om-1")["status"])
+        self.assertEqual([], state["remaining_blocking_issues"])
+        self.assertNotIn("open_substance_majors", state["final_status_reasons"])
+        self.assertEqual([], schema.validate(state, "state"))
+
+    def test_a_row_the_recheck_leaves_open_sends_the_memo_to_manual_review(self):
+        rows = [_major("om-1", "citations")]
+        driver, recheck = _to_recheck(self, "om-left-open", rows, dispositions=[("om-1", "polish")])
+        _answer(driver, recheck, _recheck_document(driver, resolutions=[("om-1", "open")]))
+        second = driver.next()
+        self.assertIn(_finding_line(rows[0]) + " · status: unresolved", second["agents"][0]["prompt"])
+        driver.act(second)
+        driver.run_to_end()
+
+        state = driver.state()
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+        self.assertIn("open_substance_majors", state["final_status_reasons"])
+        self.assertEqual("unresolved", _row(state, "om-1")["status"])
+        moved = [row for row in state["remaining_blocking_issues"] if row.get("issue") == rows[0]["issue"]]
+        self.assertEqual(1, len(moved))
+        self.assertEqual(("major", "s-3"), (moved[0]["severity"], moved[0]["section_id"]))
+        status = md_fallback.render_status(md_fallback.status_inputs(state))
+        self.assertIn(f"- major · section 3 · {rows[0]['issue']}", status)
+        summary = (driver.work_dir / "summary.md").read_text(encoding="utf-8")
+        findings = summary.partition("## Open reviewer findings")[2]
+        self.assertNotIn(rows[0]["issue"], findings, "a row moved into the blockers is not printed twice")
+
+    def test_an_unusable_recheck_resolves_nothing_whatever_its_resolutions_say(self):
+        cases = {
+            "stub": lambda driver: {
+                "reviewer": "citations",
+                "status": "failed",
+                "reason": "The auditor gave up.",
+                "draft_sha": str(driver.state()["current_draft_sha"]),
+                "iteration": 1,
+            },
+            "invalid": lambda driver: dict(
+                _recheck_document(driver, resolutions=[("om-1", "resolved")]),
+                checklist=[
+                    item
+                    for item in _recheck_document(driver)["checklist"]
+                    if item["id"] != "CIT-10"
+                ],
+            ),
+            "downgraded": lambda driver: _recheck_document(
+                driver, resolutions=[("om-1", "resolved")], unknown=("CIT-02",)
+            ),
+        }
+        for name, build in cases.items():
+            with self.subTest(recheck=name):
+                rows = [_major("om-1", "citations")]
+                driver, recheck = _to_recheck(self, f"om-{name}", rows, dispositions=[("om-1", "polish")])
+                _answer(driver, recheck, build(driver))
+                driver.run_to_end()
+                state = driver.state()
+                self.assertEqual("unresolved", _row(state, "om-1")["status"])
+                self.assertEqual("manual_review_required_on_v1", state["final_status"])
+                self.assertIn("open_substance_majors", state["final_status_reasons"])
+                if name == "downgraded":
+                    # The synthetic `document` blocker of the unverified CIT-02 is kept all the same.
+                    kept = [row for row in state["remaining_blocking_issues"] if row.get("checklist_id") == "CIT-02"]
+                    self.assertEqual(["unverified_hard_fail"], [row["category"] for row in kept])
+                    self.assertIn("polish_recheck_blocker", state["final_status_reasons"])
+
+    def test_a_recheck_blocker_under_a_polished_counterarguments_row_reaches_the_russian_status(self):
+        rows = [_major("om-1", "counterarguments")]
+        driver, recheck = _to_recheck(
+            self, "om-ru-blocker", rows, dispositions=[("om-1", "polish")], language="ru"
+        )
+        # Class-independent: a softened counterarguments sentence is re-checked by the citations agent.
+        self.assertEqual("citations_polish", recheck["agents"][0]["slot"])
+        self.assertIn("the open findings om-1 · counterarguments · ", recheck["agents"][0]["prompt"])
+        _answer(
+            driver,
+            recheck,
+            _recheck_document(
+                driver, resolutions=[("om-1", "resolved")], issues=[RECHECK_BLOCKER], failed=("CIT-01",)
+            ),
+        )
+        driver.run_to_end()
+
+        state = driver.state()
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+        self.assertIn("polish_recheck_blocker", state["final_status_reasons"])
+        # D-237: an unresolved logic/counterarguments row now reaches the Status.
+        self.assertIn("open_substance_majors", state["final_status_reasons"])
+        self.assertEqual("unresolved", _row(state, "om-1")["status"])
+        self.assertIn(RECHECK_BLOCKER, state["remaining_blocking_issues"])
+        status = md_fallback.render_status(md_fallback.status_inputs(state))
+        self.assertIn(f"- блокирующее замечание · раздел 3 · {RECHECK_BLOCKER['issue_client']}", status)
+        # The moved row has no client sentence: the Russian Status prints the pack's line, never the English issue.
+        without = md_fallback.label("status_issue_without_client_text", "ru")
+        self.assertIn(f"- существенное замечание · раздел 3 · {without}", status)
+        self.assertNotIn(rows[0]["issue"], status)
+
+    def test_a_downgraded_recheck_keeps_its_own_blocker_and_the_synthetic_one(self):
+        rows = [_major("om-1", "counterarguments")]
+        driver, recheck = _to_recheck(self, "om-both-blockers", rows, dispositions=[("om-1", "polish")])
+        blocker = {key: value for key, value in RECHECK_BLOCKER.items() if key != "issue_client"}
+        _answer(
+            driver,
+            recheck,
+            _recheck_document(
+                driver,
+                resolutions=[("om-1", "resolved")],
+                issues=[blocker],
+                failed=("CIT-01",),
+                unknown=("CIT-05",),
+            ),
+        )
+        driver.run_to_end()
+
+        state = driver.state()
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+        self.assertEqual("unresolved", _row(state, "om-1")["status"])
+        kept = [
+            (row.get("category"), row.get("section_id"))
+            for row in state["remaining_blocking_issues"]
+            if row.get("checklist_id") in ("CIT-01", "CIT-05")
+        ]
+        self.assertEqual([("unsupported_law", "s-3"), ("unverified_hard_fail", "document")], kept)
+
+    def test_an_out_of_scope_polish_puts_the_baseline_back_and_pins_the_export(self):
+        rows = [_major("om-1", "citations")]
+        driver, first = _to_readiness(self, "om-out-of-scope", rows)
+        baseline = (driver.work_dir / "drafts/v1.md").read_bytes()
+        baseline_sha = state_io.sha256_bytes(baseline)
+        _answer(
+            driver,
+            first,
+            _readiness_document(driver, "needs_final_polish", issues=[SOFTEN_S3], dispositions=[("om-1", "polish")]),
+        )
+        polish = driver.next()
+        _act_writer(driver, polish, edit=OUT_OF_SCOPE_EDIT)
+        self.assertNotEqual(baseline, (driver.work_dir / "drafts/v1.md").read_bytes())
+
+        render = driver.next()
+        self.assertEqual("docx.render", machine.command_key(render["command"]))
+        self.assertEqual(baseline_sha, render["command"][render["command"].index("--draft-sha") + 1])
+        state = driver.state()
+        self.assertEqual(baseline, (driver.work_dir / "drafts/v1.md").read_bytes())
+        self.assertEqual(baseline_sha, stepctx.published_sha(state, "drafts/v1.md"))
+        self.assertEqual(baseline_sha, state["current_draft_sha"])
+        self.assertEqual({"version": 1, "sha256": baseline_sha}, state["export_pin"])
+        self.assertEqual((baseline_sha, 1), machine.export_draft_sha(state))
+        version = next(row for row in state["draft_versions"] if row["version"] == 1)
+        self.assertEqual(
+            (baseline_sha, True, True), (version["sha256"], version["lint_clean"], version["citations_clean"])
+        )
+        self.assertEqual(["section_out_of_scope: s-2"], state["polish_check"]["errors"])
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+        self.assertIn("polish_out_of_scope", state["final_status_reasons"])
+        # No re-check ran, so the polished row is unresolved and its citations finding goes to the Status.
+        self.assertEqual("unresolved", _row(state, "om-1")["status"])
+        self.assertIn("open_substance_majors", state["final_status_reasons"])
+        self.assertEqual([], schema.validate(state, "state"))
+
+    def test_a_polish_may_cite_in_the_polished_section_a_source_the_summary_cites(self):
+        # D-236 (incident I2): the reuse is no scope error, and the citations re-check grades that section.
+        original = probe.fixture_draft
+        cited: list[str] = []
+
+        def summary_cites(work_dir, state, version, existing, language="en"):
+            text = original(work_dir, state, version, existing, language)
+            if existing:
+                return text
+            cited.append(sorted(sources.read_registry(work_dir)["sources"])[1])
+            return text.replace(
+                "beyond the purpose that justified them.",
+                f"beyond the purpose that justified them [[src:{cited[-1]} art 5(1)(e)]].",
+                1,
+            )
+
+        rows = [_major("om-1", "citations")]
+        with mock.patch.object(probe, "fixture_draft", side_effect=summary_cites):
+            driver, first = _to_readiness(self, "om-reuse", rows)
+        source_id = cited[0]
+        self.assertIn(f"[[src:{source_id} art 5(1)(e)]]", (driver.work_dir / "drafts/v1.md").read_text("utf-8"))
+        _answer(
+            driver,
+            first,
+            _readiness_document(driver, "needs_final_polish", issues=[SOFTEN_S3], dispositions=[("om-1", "polish")]),
+        )
+        _act_writer(
+            driver,
+            driver.next(),
+            edit=(
+                "exceeds that period (v1 review).",
+                f"exceeds that period (v1 review) [[src:{source_id} art 5(1)(e)]].",
+            ),
+        )
+
+        finish = driver.next()
+        self.assertEqual("draft.finish", machine.command_key(finish["command"]))
+        state = driver.state()
+        self.assertEqual([], state["polish_check"]["errors"])
+        driver.act(finish)
+        recheck = driver.next()
+        agent = recheck["agents"][0]
+        self.assertEqual("citations_polish", agent["slot"])
+        self.assertIn("Scope: sections s-3; the open findings om-1 · citations · ", agent["prompt"])
+        self.assertNotIn("polish_out_of_scope", driver.state()["final_status_reasons"])
+
+    def test_an_out_of_scope_polish_after_a_forced_exit_on_v2_keeps_the_label_and_pins_v2(self):
+        # Fix round 1 (5): the scope error follows the settlement rule - a forced exit keeps its label.
+        rows = [_major("om-1", "citations")]
+        driver = Driver(temp_root(self), slug="om-pin-v2")
+        with mock.patch.object(review, "open_substance_majors", side_effect=lambda *_: copy.deepcopy(rows)):
+            first = driver.run_until("revision_loop")
+            CompletionTest._act_reviewers_with_blocker(driver, first)
+            writer = _next_writer_dispatch(driver)
+            _act_writer(driver, writer, edit=BREAK_RISK)  # v2 fails L-07 and is never checked clean
+            readiness = driver.run_until("client_readiness")
+        state = driver.state()
+        versions = {row["version"]: row for row in state["draft_versions"]}
+        self.assertTrue(versions[1]["lint_clean"] and versions[1]["citations_clean"])
+        self.assertFalse(versions[2]["lint_clean"])
+        self.assertEqual("drafts/v2.md", state["current_draft_path"])
+        baseline_sha = str(machine.current_draft_sha(state))
+        _answer(
+            driver,
+            readiness,
+            _readiness_document(driver, "needs_final_polish", issues=[SOFTEN_S3], dispositions=[("om-1", "polish")]),
+        )
+        polish = driver.next()
+        _act_writer(driver, polish, edit=OUT_OF_SCOPE_EDIT)
+
+        render = driver.next()  # the same `mf next` reverts, pins and issues the export
+        self.assertEqual("docx.render", machine.command_key(render["command"]))
+        self.assertEqual(baseline_sha, render["command"][render["command"].index("--draft-sha") + 1])
+        state = driver.state()
+        self.assertEqual({"version": 2, "sha256": baseline_sha}, state["export_pin"])
+        self.assertEqual("forced_exit_on_v2_with_remaining_issues", state["final_status"])
+        self.assertIn("polish_out_of_scope", state["final_status_reasons"])
+        unpinned = {key: value for key, value in state.items() if key != "export_pin"}
+        self.assertEqual(1, machine.export_draft_sha(unpinned)[1], "without the pin the checked v1 would go out")
+
+        # `finalize` selects without a sha: the pin binds it too, so the delivered memo is v2's baseline.
+        driver.act(render)
+        driver.run_to_end()
+        state = driver.state()
+        self.assertEqual(baseline_sha, docx_export.select_draft(state, driver.work_dir)["sha256"])
+        memo = docx_export.memo_md_path(driver.work_dir, docx_export.slug_of(state, driver.work_dir))
+        text = memo.read_text(encoding="utf-8")
+        self.assertIn("(v2 review)", text)
+        self.assertNotIn("under its own policy", text)
+        self.assertEqual("forced_exit_on_v2_with_remaining_issues", state["final_status"])
+
+    def test_an_unavailable_baseline_is_a_failed_scope_check(self):
+        # Fix round 1 (1): a logic polish would otherwise pass unchecked and leave the run approved.
+        def delete(path: Path) -> None:
+            path.unlink()
+
+        def drift(path: Path) -> None:
+            path.write_bytes(path.read_bytes() + b"\nEdited after publication.\n")
+
+        for name, damage, before_check in (
+            ("deleted", delete, True),
+            ("drifted", drift, True),
+            ("deleted-after-the-check", delete, False),
+        ):
+            with self.subTest(baseline=name):
+                rows = [_major("om-1", "logic")]
+                driver, first = _to_readiness(self, f"om-no-baseline-{name}", rows)
+                _answer(
+                    driver,
+                    first,
+                    _readiness_document(
+                        driver, "needs_final_polish", issues=[SOFTEN_S3], dispositions=[("om-1", "polish")]
+                    ),
+                )
+                _act_writer(driver, driver.next())  # the fixture writer rewrites one sentence of s-3
+                if before_check:
+                    damage(driver.work_dir / PREPOLISH_V1)
+                    render = driver.next()
+                else:
+                    finish = driver.next()
+                    self.assertEqual([], driver.state()["polish_check"]["errors"])
+                    damage(driver.work_dir / PREPOLISH_V1)
+                    driver.act(finish)
+                    render = driver.next()  # the re-check cannot read the baseline: no re-check, no approval
+                self.assertEqual("docx.render", machine.command_key(render["command"]))
+                state = driver.state()
+                self.assertEqual(["baseline_unavailable"], state["polish_check"]["errors"])
+                self.assertEqual("manual_review_required_on_v1", state["final_status"])
+                self.assertIn("polish_out_of_scope", state["final_status_reasons"])
+                self.assertEqual("unresolved", _row(state, "om-1")["status"])
+                # No version whose bytes the loop reviewed is left (v1 was polished in place): no pin, and
+                # the export carries the polished v1 under manual review.
+                self.assertNotIn("export_pin", state)
+                self.assertEqual(
+                    machine.current_draft_sha(state), render["command"][render["command"].index("--draft-sha") + 1]
+                )
+                self.assertEqual([], machine._polish_recheck_steps(state, 1))  # noqa: SLF001
+
+    def test_an_unavailable_baseline_pins_the_last_version_the_loop_reviewed(self):
+        # Fix round 1 (1): v2 is polished in place with no baseline to restore; v1's bytes were reviewed.
+        rows = [_major("om-1", "counterarguments")]
+        driver = Driver(temp_root(self), slug="om-no-baseline-v2")
+        with mock.patch.object(review, "open_substance_majors", side_effect=lambda *_: copy.deepcopy(rows)):
+            first = driver.run_until("revision_loop")
+            CompletionTest._act_reviewers_with_blocker(driver, first)
+            driver.act(_next_writer_dispatch(driver))
+            readiness = driver.run_until("client_readiness")
+        state = driver.state()
+        self.assertEqual("approved_on_v2", state["final_status"])
+        v1_sha = next(row["sha256"] for row in state["draft_versions"] if row["version"] == 1)
+        _answer(
+            driver,
+            readiness,
+            _readiness_document(driver, "needs_final_polish", issues=[SOFTEN_S3], dispositions=[("om-1", "polish")]),
+        )
+        _act_writer(driver, driver.next())
+        (driver.work_dir / "reviews/v2-prepolish.md").unlink()
+
+        render = driver.next()
+        self.assertEqual(v1_sha, render["command"][render["command"].index("--draft-sha") + 1])
+        state = driver.state()
+        self.assertEqual({"version": 1, "sha256": v1_sha}, state["export_pin"])
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+        self.assertIn("polish_out_of_scope", state["final_status_reasons"])
+
+    def test_a_duplicated_resolution_id_resolves_nothing_whatever_the_order(self):
+        # Fix round 1 (2): the rest of the re-check stays usable, and its blockers are kept.
+        blocker = dict(
+            {key: value for key, value in RECHECK_BLOCKER.items() if key != "issue_client"}, section_id="s-2"
+        )
+        for order in (("open", "resolved"), ("resolved", "open")):
+            with self.subTest(order=order):
+                rows = [_major("om-1", "citations"), _major("om-2", "logic")]
+                driver, recheck = _to_recheck(
+                    self, f"om-dup-{order[0]}", rows, dispositions=[("om-1", "polish"), ("om-2", "polish")]
+                )
+                resolutions = [("om-1", order[0]), ("om-2", "resolved"), ("om-1", order[1])]
+                _answer(
+                    driver,
+                    recheck,
+                    _recheck_document(driver, resolutions=resolutions, issues=[blocker], failed=("CIT-01",)),
+                )
+                driver.run_to_end()
+                state = driver.state()
+                self.assertEqual("unresolved", _row(state, "om-1")["status"])
+                self.assertEqual("resolved", _row(state, "om-2")["status"])
+                self.assertEqual("manual_review_required_on_v1", state["final_status"])
+                self.assertIn("open_substance_majors", state["final_status_reasons"])
+                self.assertIn("polish_recheck_blocker", state["final_status_reasons"])
+                self.assertIn(blocker, state["remaining_blocking_issues"])
+
+    def test_a_cancel_after_the_recheck_still_settles_its_blocker(self):
+        # Fix round 1 (4): cancellation goes straight to `finalize`; the readiness settlement runs first.
+        rows = [_major("om-1", "counterarguments")]
+        driver, recheck = _to_recheck(self, "om-cancel", rows, dispositions=[("om-1", "polish")])
+        blocker = {key: value for key, value in RECHECK_BLOCKER.items() if key != "issue_client"}
+        _answer(
+            driver,
+            recheck,
+            _recheck_document(driver, resolutions=[("om-1", "resolved")], issues=[blocker], failed=("CIT-01",)),
+        )
+        second = driver.next()
+        self.assertTrue(second["agents"][0]["subagent_type"].endswith("client-readiness-reviewer"))
+        self.assertEqual("approved_on_v1", driver.state()["final_status"])
+        state_io.write_state(driver.work_dir, lambda current: current.update({"cancel_requested": True}))
+        driver.run_to_end()
+
+        state = driver.state()
+        self.assertEqual("cancelled_by_user", state["current_phase"])
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+        self.assertIn("polish_recheck_blocker", state["final_status_reasons"])
+        self.assertIn(blocker, state["remaining_blocking_issues"])
+        self.assertEqual("unresolved", _row(state, "om-1")["status"])
+        summary = (driver.work_dir / "summary.md").read_text(encoding="utf-8")
+        self.assertIn(f"- blocker · s-3 · {blocker['issue']}", summary)
+        status = md_fallback.render_status(md_fallback.status_inputs(state))
+        self.assertIn(f"- blocker · section 3 · {blocker['issue']}", status)
+
+    def _cancel_after_polish(self, slug: str, rows: list[dict], edit: tuple[str, str] | None) -> tuple:
+        """Pass 1 asks for the polish, the writer publishes it, and the run is cancelled at once."""
+        driver, first = _to_readiness(self, slug, rows)
+        baseline = (driver.work_dir / "drafts/v1.md").read_bytes()
+        _answer(
+            driver,
+            first,
+            _readiness_document(driver, "needs_final_polish", issues=[SOFTEN_S3], dispositions=[("om-1", "polish")]),
+        )
+        _act_writer(driver, driver.next(), edit=edit)
+        polished = driver.state()["current_draft_sha"]
+        self.assertNotEqual(state_io.sha256_bytes(baseline), polished)
+        self.assertNotIn("polish_check", driver.state())
+        state_io.write_state(driver.work_dir, lambda current: current.update({"cancel_requested": True}))
+        return driver, baseline, polished
+
+    def test_a_cancel_right_after_an_out_of_scope_polish_restores_the_baseline(self):
+        # Final fix wave: a cancellation must not deliver an unchecked polish under the loop's approval.
+        driver, baseline, _ = self._cancel_after_polish("om-cancel-out", [_major("om-1", "logic")], OUT_OF_SCOPE_EDIT)
+        baseline_sha = state_io.sha256_bytes(baseline)
+        finalize = driver.next()  # no agent: the scope decision, then the always-deliver finalize
+        self.assertEqual("finalize", machine.command_key(finalize["command"]))
+        state = driver.state()
+        self.assertEqual(["section_out_of_scope: s-2"], state["polish_check"]["errors"])
+        self.assertEqual(baseline, (driver.work_dir / "drafts/v1.md").read_bytes())
+        self.assertEqual({"version": 1, "sha256": baseline_sha}, state["export_pin"])
+        self.assertEqual((baseline_sha, 1), machine.export_draft_sha(state))
+        self.assertEqual(baseline_sha, docx_export.select_draft(state, driver.work_dir)["sha256"])
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+        self.assertIn("polish_out_of_scope", state["final_status_reasons"])
+        self.assertEqual("unresolved", _row(state, "om-1")["status"])
+        self.assertEqual([], machine._polish_recheck_steps(state, 1))  # noqa: SLF001
+        driver.act(finalize)
+        driver.run_to_end()
+
+        state = driver.state()
+        self.assertEqual("cancelled_by_user", state["current_phase"])
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+        memo = docx_export.memo_md_path(driver.work_dir, docx_export.slug_of(state, driver.work_dir))
+        self.assertNotIn("under its own policy", memo.read_text(encoding="utf-8"))
+
+    def test_a_cancel_right_after_an_in_scope_polish_settles_as_before(self):
+        # Final fix wave: the check passes, nothing is restored or pinned, and the settlement runs as it did.
+        rows = [_major("om-1", "citations")]
+        driver, _, polished = self._cancel_after_polish("om-cancel-in", rows, None)  # the fixture edits s-3
+        driver.run_to_end()
+
+        state = driver.state()
+        self.assertEqual("cancelled_by_user", state["current_phase"])
+        self.assertEqual({"draft_sha": polished, "errors": []}, state["polish_check"])
+        self.assertNotIn("export_pin", state)
+        self.assertEqual("unresolved", _row(state, "om-1")["status"])
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+        self.assertIn("open_substance_majors", state["final_status_reasons"])
+        self.assertNotIn("polish_out_of_scope", state["final_status_reasons"])
+        self.assertEqual([rows[0]["issue"]], [row["issue"] for row in state["remaining_blocking_issues"]])
+
+    def test_a_lint_fix_after_the_polish_is_outside_the_scope_check(self):
+        rows = [_major("om-1", "logic")]
+        driver, first = _to_readiness(self, "om-lint-fix", rows)
+        _answer(
+            driver,
+            first,
+            _readiness_document(driver, "needs_final_polish", issues=[SOFTEN_S3], dispositions=[("om-1", "leave")]),
+        )
+        polish = driver.next()
+        _act_writer(driver, polish, edit=BREAK_RISK)  # in s-3, inside the scope, but it breaks L-07
+        driver.act(driver.next())  # draft finish: not clean
+        fix = driver.next()
+        self.assertTrue(fix["agents"][0]["subagent_type"].endswith("memo-writer"))
+        self.assertEqual(1, driver.state()["attempts"]["lint_fix"]["polish"])
+        agent = fix["agents"][0]
+        identity = {"step_id": fix["step_id"], "attempt": fix["attempt"]}
+        probe.run_fixture_agent(driver.work_dir, driver.state(), identity, agent)
+        target = driver.work_dir / agent["expected_outputs"][0]["work_path"]
+        text = target.read_text(encoding="utf-8").replace(BREAK_RISK[1], BREAK_RISK[0], 1)
+        target.write_bytes(text.replace(OUT_OF_SCOPE_EDIT[0], OUT_OF_SCOPE_EDIT[1], 1).encode("utf-8"))
+        _agent_done(driver, fix, agent["slot"])
+        driver.report(fix["step_id"], fix["attempt"], agent=agent["slot"])
+
+        second = _next_dispatch_of(driver, "client-readiness-reviewer")
+        state = driver.state()
+        self.assertEqual("client_readiness", state["current_phase"])
+        self.assertEqual([], state["polish_check"]["errors"])
+        self.assertNotIn("polish_out_of_scope", state["final_status_reasons"])
+        self.assertIn(_finding_line(rows[0]) + " · status: left", second["agents"][0]["prompt"])
+
+    def test_a_citations_row_left_or_without_a_disposition_goes_to_manual_review(self):
+        for name, dispositions in (("leave", [("om-1", "leave")]), ("missing", None)):
+            with self.subTest(disposition=name):
+                rows = [_major("om-1", "citations")]
+                driver, first = _to_readiness(self, f"om-cit-{name}", rows)
+                _answer(driver, first, _readiness_document(driver, "client_ready", dispositions=dispositions))
+                driver.next()
+                state = driver.state()
+                self.assertEqual("export", state["current_phase"])
+                self.assertEqual("manual_review", _row(state, "om-1")["status"])
+                self.assertEqual("manual_review_required_on_v1", state["final_status"])
+                self.assertIn("open_substance_majors", state["final_status_reasons"])
+                self.assertEqual(
+                    [rows[0]["issue"]], [row["issue"] for row in state["remaining_blocking_issues"]]
+                )
+
+    def test_a_polish_row_without_a_polish_budget_is_unresolved(self):
+        rows = [_major("om-1", "citations")]
+        driver, first = _to_readiness(self, "om-no-budget", rows)
+        state_io.write_state(driver.work_dir, lambda current: current["config"].update(max_client_polish=0))
+        self.assertEqual(0, driver.state()["config"]["max_client_polish"])
+        _answer(
+            driver,
+            first,
+            _readiness_document(driver, "needs_final_polish", issues=[SOFTEN_S3], dispositions=[("om-1", "polish")]),
+        )
+        driver.next()
+        state = driver.state()
+        self.assertEqual("export", state["current_phase"])
+        self.assertEqual("unresolved", _row(state, "om-1")["status"])
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+        self.assertIn("open_substance_majors", state["final_status_reasons"])
+        self.assertIsNone(stepctx.published_entry(state, PREPOLISH_V1))
+
+    def test_a_logic_row_left_keeps_the_status_and_reaches_the_summary(self):
+        rows = [_major("om-1", "logic")]
+        driver, first = _to_readiness(self, "om-logic-left", rows)
+        _answer(driver, first, _readiness_document(driver, "client_ready", dispositions=[("om-1", "leave")]))
+        driver.run_to_end()
+        state = driver.state()
+        self.assertEqual("approved_on_v1", state["final_status"])
+        self.assertEqual("left", _row(state, "om-1")["status"])
+        self.assertEqual([], state["remaining_blocking_issues"])
+        summary = (driver.work_dir / "summary.md").read_text(encoding="utf-8")
+        self.assertIn("- logic · loop · left · s-3 · overstated_recourse · ", summary)
+
+    def test_a_logic_row_sent_to_manual_review_reaches_the_status(self):
+        # D-237: a finding no polish can answer goes to a lawyer, and the Status section prints it.
+        rows = [_major("om-1", "logic")]
+        driver, first = _to_readiness(self, "om-logic-manual", rows)
+        _answer(
+            driver,
+            first,
+            _readiness_document(driver, "manual_review_required", dispositions=[("om-1", "manual_review")]),
+        )
+        driver.run_to_end()
+        state = driver.state()
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+        self.assertIn("open_substance_majors", state["final_status_reasons"])
+        self.assertEqual("manual_review", _row(state, "om-1")["status"])
+        self.assertEqual(1, len(state["remaining_blocking_issues"]))
+        moved = state["remaining_blocking_issues"][0]
+        self.assertEqual(
+            (rows[0]["issue"], "logic", "Fixture disposition."),
+            (moved["issue"], moved["source_reviewer"], moved["disposition_note"]),
+        )
+        self.assertEqual("manual_review", moved["disposition"])
+        # D-252: the English Status row is the lawyer's question; `summary.md` keeps the issue and the note.
+        status = md_fallback.render_status(md_fallback.status_inputs(state))
+        self.assertIn("- major · section 3 · Fixture disposition.", status)
+        self.assertNotIn(rows[0]["issue"], status)
+        summary = (driver.work_dir / "summary.md").read_text(encoding="utf-8")
+        self.assertEqual(1, summary.count(rows[0]["issue"]))
+        self.assertIn(f"- major · s-3 · {rows[0]['issue']} · Fixture disposition.", summary)
+
+    def test_a_new_major_of_the_recheck_is_summary_only_and_asks_no_disposition(self):
+        rows = [_major("om-1", "citations")]
+        driver, recheck = _to_recheck(self, "om-recheck-major", rows, dispositions=[("om-1", "polish")])
+        major = {
+            "severity": "major",
+            "category": "overstated_currency",
+            "section_id": "s-3",
+            "issue": "The guidance is described as settled practice.",
+            "suggestion": "Describe it as guidance.",
+            "issue_category": "source_drift",
+        }
+        _answer(driver, recheck, _recheck_document(driver, resolutions=[("om-1", "resolved")], issues=[major]))
+        second = driver.next()
+        prompt = second["agents"][0]["prompt"]
+        self.assertIn(_finding_line(rows[0]) + " · status: resolved", prompt)
+        self.assertIn(
+            f"- om-2 · citations · s-3 · {major['issue']} · {major['suggestion']} · "
+            "raised by the polish re-check (for information, no disposition)",
+            prompt,
+        )
+        driver.act(second)
+        driver.run_to_end()
+        state = driver.state()
+        self.assertEqual("approved_on_v1", state["final_status"])
+        added = _row(state, "om-2")
+        self.assertEqual(("recheck", "open", 1), (added["origin"], added["status"], added["from_iteration"]))
+        summary = (driver.work_dir / "summary.md").read_text(encoding="utf-8")
+        self.assertIn(f"- citations · recheck · open · s-3 · overstated_currency · {major['issue']}", summary)
+
+    def test_a_recheck_that_fails_twice_spends_its_own_budget_once(self):
+        rows = [_major("om-1", "citations")]
+        driver, recheck = _to_recheck(self, "om-recheck-fails", rows, dispositions=[("om-1", "polish")])
+        baseline = stepctx.published_entry(driver.state(), PREPOLISH_V1)
+        driver.report(recheck["step_id"], recheck["attempt"], agent="citations_polish", status="fail")
+        retry = driver.next()
+        self.assertEqual((recheck["step_id"], 2, "failure"), (retry["step_id"], retry["attempt"], retry["reason"]))
+        driver.report(retry["step_id"], retry["attempt"], agent="citations_polish", status="fail")
+        state = driver.state()
+        self.assertEqual(1, review.failure_retry_attempts(state, 1, "citations_polish"))
+        self.assertEqual(1, review.json_retry_used(state, 1, "citations_polish"))
+        self.assertEqual(0, review.json_retry_used(state, 1, "citations"), "the loop's own budget is untouched")
+
+        second = driver.next()  # the budget is spent: the re-check closes `fail`, pass 2 is dispatched
+        self.assertTrue(second["agents"][0]["subagent_type"].endswith("client-readiness-reviewer"))
+        self.assertIn(_finding_line(rows[0]) + " · status: unresolved", second["agents"][0]["prompt"])
+        again = driver.next()  # a restart re-issues the open readiness step, never a third re-check
+        self.assertTrue(again["agents"][0]["subagent_type"].endswith("client-readiness-reviewer"))
+        state = driver.state()
+        rechecks = {
+            row["step_id"]
+            for row in state["steps"]
+            for entry in row.get("expected_outputs") or []
+            if entry.get("canonical_path") == "reviews/v1-citations_polish.json"
+        }
+        self.assertEqual({recheck["step_id"]}, rechecks)
+        self.assertEqual(baseline, stepctx.published_entry(state, PREPOLISH_V1))
+        driver.act(again)
+        driver.run_to_end()
+        state = driver.state()
+        self.assertEqual("unresolved", _row(state, "om-1")["status"])
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+
+
+POLISH_DRAFT_EN = "\n".join(
+    [
+        "# Retention of customer records",
+        "",
+        "Date: 2026-09-22.",
+        "",
+        "## 1. Executive summary",
+        "",
+        "- Records may not be kept beyond their purpose [[src:gdpr art 5(1)(e)]]. Risk: medium.",
+        "",
+        "## 2. Facts, assumptions and limitations",
+        "",
+        "The client keeps customer records for seven years.",
+        "",
+        "## 5. Analysis of the retention period",
+        "",
+        "The provision governs every record the client keeps.",
+        "",
+        "### 5.1 The purpose test",
+        "",
+        "The purpose ends when the contract ends [[src:gdpr art 5(1)(b)]].",
+        "",
+        "### 5.2 The tax carve-out",
+        "",
+        "Tax law compels a longer period [[src:tax-code s 147]].",
+        "",
+        "## 6. Conclusion and recommendations",
+        "",
+        "- Confirm the tax basis before the next audit; owner: counsel.",
+        "",
+    ]
+)
+"""A classical draft with nested sections: s-1 summary, s-2 facts, s-5 with s-5-1 and s-5-2, s-6 conclusion."""
+
+POLISH_DRAFT_RU = "\n".join(
+    [
+        "# Хранение клиентских записей",
+        "",
+        "## 1. Резюме",
+        "",
+        "- Записи нельзя хранить дольше цели обработки [[src:fz-152 ст 5]]. Риск: средний.",
+        "",
+        "## 2. Факты, допущения и ограничения",
+        "",
+        "Клиент хранит записи семь лет.",
+        "",
+        "## 9. Срок хранения",
+        "",
+        "Норма обязывает удалить записи по достижении цели [[src:fz-152 ст 5 ч 7]].",
+        "",
+        "## 10. Налоговое исключение",
+        "",
+        "Налоговый закон может требовать более долгого хранения.",
+        "",
+        "## 11. Выводы и рекомендации",
+        "",
+        "- Подтвердить налоговое основание до следующей проверки; ответственный: юрист.",
+        "",
+    ]
+)
+"""The Russian shape of the 2026-09-21 run: «Резюме» is s-1, the polished section s-9, «Выводы и рекомендации» s-11."""
+
+
+def _edit(text: str, *pairs: tuple[str, str]) -> str:
+    for old, new in pairs:
+        if old not in text:
+            raise AssertionError(f"not in the draft: {old!r}")
+        text = text.replace(old, new, 1)
+    return text
+
+
+class PolishScopeTest(unittest.TestCase):
+    """D-211: `polish_scope_errors` — changed sections outside the readiness issues, and grown token sets."""
+
+    SUMMARY = ("their purpose [[src:gdpr art 5(1)(e)]].", "their purpose, as a rule [[src:gdpr art 5(1)(e)]].")
+    CONCLUSION = ("before the next audit;", "before the next audit, in writing;")
+    CHILD = ("Tax law compels a longer period", "Tax law may compel a longer period")
+    SIBLING = ("The purpose ends when", "The purpose arguably ends when")
+
+    def test_the_polished_section_and_the_cross_reference_sections_are_in_scope(self):
+        after = _edit(POLISH_DRAFT_EN, self.CHILD, self.SUMMARY, self.CONCLUSION)
+        self.assertEqual([], machine.polish_scope_errors(POLISH_DRAFT_EN, after, {"s-5-2"}))
+
+    def test_a_sibling_of_the_polished_section_is_out_of_scope(self):
+        after = _edit(POLISH_DRAFT_EN, self.CHILD, self.SIBLING)
+        self.assertEqual(
+            ["section_out_of_scope: s-5-1"], machine.polish_scope_errors(POLISH_DRAFT_EN, after, {"s-5-2"})
+        )
+
+    def test_an_issue_on_a_parent_allows_its_children(self):
+        after = _edit(POLISH_DRAFT_EN, self.CHILD, self.SIBLING)
+        self.assertEqual([], machine.polish_scope_errors(POLISH_DRAFT_EN, after, {"s-5"}))
+        facts = _edit(POLISH_DRAFT_EN, ("seven years.", "seven years under its policy."))
+        self.assertEqual(["section_out_of_scope: s-2"], machine.polish_scope_errors(POLISH_DRAFT_EN, facts, {"s-5"}))
+
+    def test_a_new_source_id_is_refused_even_in_a_cross_reference_section(self):
+        after = _edit(POLISH_DRAFT_EN, ("Risk: medium.", "See also [[src:tax-guidance p 4]]. Risk: medium."))
+        self.assertEqual(
+            ["new_source_token: s-1: tax-guidance"], machine.polish_scope_errors(POLISH_DRAFT_EN, after, {"s-5-2"})
+        )
+
+    def test_a_document_issue_lifts_the_sections_but_not_the_token_rule(self):
+        anywhere = _edit(POLISH_DRAFT_EN, self.SIBLING, ("seven years.", "seven years under its policy."))
+        self.assertEqual([], machine.polish_scope_errors(POLISH_DRAFT_EN, anywhere, None))
+        token = _edit(POLISH_DRAFT_EN, ("seven years.", "seven years [[src:tax-code s 147]]."))
+        self.assertEqual(["new_source_token: s-2: tax-code"], machine.polish_scope_errors(POLISH_DRAFT_EN, token, None))
+
+    def test_dropping_a_pinpoint_and_keeping_the_id_is_a_softening(self):
+        after = _edit(POLISH_DRAFT_EN, ("[[src:tax-code s 147]]", "[[src:tax-code]]"))
+        self.assertEqual([], machine.polish_scope_errors(POLISH_DRAFT_EN, after, {"s-5-2"}))
+
+    def test_an_unchanged_draft_has_no_errors(self):
+        self.assertEqual([], machine.polish_scope_errors(POLISH_DRAFT_EN, POLISH_DRAFT_EN, set()))
+
+    def test_the_russian_summary_and_conclusion_are_cross_references_under_the_memo_grammar(self):
+        after = _edit(
+            POLISH_DRAFT_RU,
+            ("Норма обязывает удалить", "Норма, по-видимому, обязывает удалить"),
+            ("дольше цели обработки", "дольше цели обработки, как правило,"),
+            ("до следующей проверки;", "до следующей проверки, письменно;"),
+        )
+        self.assertEqual([], machine.polish_scope_errors(POLISH_DRAFT_RU, after, {"s-9"}, language="ru"))
+        # The English default grammar gives «Резюме» and «Выводы и рекомендации» no kind at all.
+        self.assertEqual(
+            ["section_out_of_scope: s-1", "section_out_of_scope: s-11"],
+            machine.polish_scope_errors(POLISH_DRAFT_RU, after, {"s-9"}),
+        )
+        token = _edit(after, ("Риск: средний.", "См. [[src:nk-rf ст 23]]. Риск: средний."))
+        self.assertEqual(
+            ["new_source_token: s-1: nk-rf"],
+            machine.polish_scope_errors(POLISH_DRAFT_RU, token, {"s-9"}, language="ru"),
+        )
+
+    REUSE_IN_S52 = ("compels a longer period [[src:tax-code s 147]].",
+                    "compels a longer period [[src:tax-code s 147]] [[src:gdpr art 5(1)(b)]].")
+
+    def test_a_source_the_memo_cites_may_move_into_a_section_an_open_polish_row_holds(self):
+        # D-236: the citations re-check grades the sections of the open polish rows.
+        after = _edit(POLISH_DRAFT_EN, self.REUSE_IN_S52)
+        self.assertEqual([], machine.polish_scope_errors(POLISH_DRAFT_EN, after, {"s-5-2"}, graded={"s-5-2"}))
+        self.assertEqual([], machine.polish_scope_errors(POLISH_DRAFT_EN, after, {"s-5"}, graded={"s-5"}))
+        self.assertEqual([], machine.polish_scope_errors(POLISH_DRAFT_EN, after, None, graded={"document"}))
+
+    def test_a_reused_source_outside_the_polished_rows_is_still_refused(self):
+        after = _edit(POLISH_DRAFT_EN, ("Risk: medium.", "See [[src:tax-code s 147]]. Risk: medium."))
+        self.assertEqual(["new_source_token: s-1: tax-code"],
+                         machine.polish_scope_errors(POLISH_DRAFT_EN, after, {"s-5-2"}, graded={"s-5-2"}))
+        moved = _edit(POLISH_DRAFT_EN, self.REUSE_IN_S52)
+        self.assertEqual(["new_source_token: s-5-2: gdpr"],
+                         machine.polish_scope_errors(POLISH_DRAFT_EN, moved, {"s-5-2"}, graded={"s-5-1"}))
+        for graded in (None, set()):
+            with self.subTest(graded=graded):
+                self.assertEqual(["new_source_token: s-5-2: gdpr"],
+                                 machine.polish_scope_errors(POLISH_DRAFT_EN, moved, {"s-5-2"}, graded=graded))
+
+    def test_a_source_the_memo_never_cites_is_refused_even_in_a_polished_section(self):
+        after = _edit(POLISH_DRAFT_EN, ("[[src:tax-code s 147]].", "[[src:tax-code s 147]] [[src:vat-act s 12]]."))
+        self.assertEqual(["new_source_token: s-5-2: vat-act"],
+                         machine.polish_scope_errors(POLISH_DRAFT_EN, after, {"s-5-2"}, graded={"s-5-2"}))
+
+    def test_a_row_is_held_by_its_section_and_every_descendant(self):
+        rows = [
+            _major("om-1", "citations", "s-5"),
+            _major("om-2", "logic", "s-2"),
+            _major("om-3", "counterarguments", "document"),
+            _major("om-4", "citations", "s-5-2", status="manual_review"),
+        ]
+        child_only = _edit(POLISH_DRAFT_EN, self.CHILD)
+        self.assertEqual(
+            ["om-1", "om-3"],
+            [row["id"] for row in machine.polished_findings(rows, POLISH_DRAFT_EN, child_only)],
+        )
+        self.assertEqual([], machine.polished_findings(rows, POLISH_DRAFT_EN, POLISH_DRAFT_EN))
+
+
+class SettleOpenMajorsTest(unittest.TestCase):
+    """D-211: what the transition to `export` does with the open majors and the re-check blockers."""
+
+    BLOCKER = {"severity": "blocker", "category": "unsupported_law", "section_id": "s-3", "issue": "No rule."}
+
+    @staticmethod
+    def state(final_status: str, *rows: dict) -> dict:
+        return {
+            "final_status": final_status,
+            "final_status_reasons": [],
+            "remaining_blocking_issues": [],
+            "open_substance_majors": [dict(row) for row in rows],
+        }
+
+    def test_an_approval_becomes_manual_review_of_its_own_version(self):
+        for status in ("approved_on_v3", "accepted_early_on_v3", "client_ready_on_v3"):
+            with self.subTest(final_status=status):
+                current = self.state(status, _major("om-1", "citations", status="manual_review"))
+                machine._settle_open_majors(current, [], 3)  # noqa: SLF001
+                self.assertEqual("manual_review_required_on_v3", current["final_status"])
+                self.assertEqual(["open_substance_majors"], current["final_status_reasons"])
+
+    def test_a_forced_exit_keeps_its_label_and_gains_the_reason(self):
+        for status in ("forced_exit_on_v2_with_remaining_issues", "manual_review_required_on_v2"):
+            with self.subTest(final_status=status):
+                current = self.state(status, _major("om-1", "citations"))
+                machine._settle_open_majors(current, [dict(self.BLOCKER)], 2)  # noqa: SLF001
+                self.assertEqual(status, current["final_status"])
+                self.assertEqual(
+                    ["open_substance_majors", "polish_recheck_blocker"], current["final_status_reasons"]
+                )
+                self.assertEqual("unresolved", current["open_substance_majors"][0]["status"])
+                self.assertEqual(2, len(current["remaining_blocking_issues"]))
+
+    def test_a_left_logic_row_still_changes_nothing(self):
+        current = self.state("approved_on_v1", _major("om-1", "logic", status="left"),
+                             _major("om-2", "citations", origin="recheck"))
+        machine._settle_open_majors(current, [], 1)  # noqa: SLF001
+        self.assertEqual("approved_on_v1", current["final_status"])
+        self.assertEqual([], current["final_status_reasons"])
+        self.assertEqual([], current["remaining_blocking_issues"])
+        self.assertEqual(["left", "open"], [row["status"] for row in current["open_substance_majors"]])
+
+    def test_an_unresolved_counterarguments_row_reaches_the_status_in_its_client_sentence(self):
+        # D-237: a gap in the reasoning goes to a lawyer, and the client sees it.
+        row = _major(
+            "om-1", "counterarguments", issue_client="Сумма 390 600 ₽ названа надёжной без оговорки о шопперах."
+        )
+        current = self.state("approved_on_v3", row)
+        machine._settle_open_majors(current, [], 3)  # noqa: SLF001
+        self.assertEqual("manual_review_required_on_v3", current["final_status"])
+        self.assertEqual(["open_substance_majors"], current["final_status_reasons"])
+        self.assertEqual("unresolved", current["open_substance_majors"][0]["status"])
+        moved = current["remaining_blocking_issues"][0]
+        self.assertEqual(("major", "s-3", row["issue_client"], "counterarguments"),
+                         (moved["severity"], moved["section_id"], moved["issue_client"], moved["source_reviewer"]))
+
+    def test_a_logic_row_sent_to_manual_review_moves(self):
+        current = self.state("approved_on_v1", _major("om-1", "logic", status="manual_review"))
+        machine._settle_open_majors(current, [], 1)  # noqa: SLF001
+        self.assertEqual("manual_review_required_on_v1", current["final_status"])
+        self.assertEqual(["open_substance_majors"], current["final_status_reasons"])
+        self.assertEqual(1, len(current["remaining_blocking_issues"]))
+
+    def test_a_moved_row_carries_the_lawyer_s_question(self):
+        # D-237 (F3): the `note` of a `manual_review` disposition is the question the lawyer must answer.
+        row = _major("om-1", "logic", status="manual_review", disposition_note="Does the exemption cover shoppers?")
+        current = self.state("approved_on_v1", row)
+        machine._settle_open_majors(current, [], 1)  # noqa: SLF001
+        moved = current["remaining_blocking_issues"][0]
+        self.assertEqual("Does the exemption cover shoppers?", moved["disposition_note"])
+        plain = self.state("approved_on_v1", _major("om-1", "logic", status="manual_review"))
+        machine._settle_open_majors(plain, [], 1)  # noqa: SLF001
+        self.assertNotIn("disposition_note", plain["remaining_blocking_issues"][0])
+
+    def test_a_moved_row_names_its_disposition(self):
+        for status in ("manual_review", "unresolved"):
+            with self.subTest(status=status):
+                moved = machine._moved_finding(_major("om-1", "counterarguments", status=status))  # noqa: SLF001
+                self.assertEqual(status, moved["disposition"])
+
+    def test_an_entry_the_previous_build_moved_is_enriched_not_duplicated(self):
+        # D-237 fix round 1: the previous build moved this row without its note (a settlement persisted by a
+        # cancel); this build's settlement, run twice, finds the entry by section, category and issue.
+        row = _major("om-1", "citations", status="manual_review", disposition_note="Is point 3 the pinpoint?")
+        current = self.state("manual_review_required_on_v1", row)
+        current["final_status_reasons"] = ["open_substance_majors"]
+        previous = {key: value for key, value in machine._moved_finding(row).items() if key != "disposition_note"}  # noqa: SLF001
+        current["remaining_blocking_issues"].append(previous)
+        review.record_banner(current, BLOCKER_BANNER, count=1)
+        for _ in range(2):
+            machine._settle_open_majors(current, [], 1)  # noqa: SLF001
+        self.assertEqual(1, len(current["remaining_blocking_issues"]))
+        self.assertEqual("Is point 3 the pinpoint?", current["remaining_blocking_issues"][0]["disposition_note"])
+        self.assertEqual(["open_substance_majors"], current["final_status_reasons"])
+        self.assertEqual([{"count": "1"}], [banner["params"] for banner in _blocker_banners(current)])
+
+    def test_two_rows_of_one_finding_keep_their_own_lawyer_questions(self):
+        # Final fix wave (finding 1): D-235 keeps a major the targeted pass repeated as two rows; each is
+        # moved into its own entry, with its own note, and a repeated settlement changes nothing.
+        issue = "The retention rule is stated more firmly than its source allows."
+        rows = (
+            _major("om-1", "logic", status="manual_review", issue=issue, disposition_note="Does art. 5 apply?"),
+            _major("om-2", "logic", status="manual_review", issue=issue, disposition_note="Is the term binding?"),
+        )
+        current = self.state("approved_on_v2", *rows)
+        machine._settle_open_majors(current, [], 2)  # noqa: SLF001
+        notes = [entry.get("disposition_note") for entry in current["remaining_blocking_issues"]]
+        self.assertEqual(["Does art. 5 apply?", "Is the term binding?"], notes)
+        settled = copy.deepcopy(current)
+        machine._settle_open_majors(current, [], 2)  # noqa: SLF001
+        self.assertEqual(settled, current)
+
+        # An entry the previous build moved (no note) is claimed by one row and enriched; the other row
+        # gets its own entry.
+        previous = self.state("manual_review_required_on_v2", *rows)
+        previous["final_status_reasons"] = ["open_substance_majors"]
+        old = {key: value for key, value in machine._moved_finding(rows[0]).items() if key != "disposition_note"}  # noqa: SLF001
+        previous["remaining_blocking_issues"].append(old)
+        for _ in range(2):
+            machine._settle_open_majors(previous, [], 2)  # noqa: SLF001
+        notes = [entry.get("disposition_note") for entry in previous["remaining_blocking_issues"]]
+        self.assertEqual(["Does art. 5 apply?", "Is the term binding?"], notes)
+
+    def test_a_move_recounts_the_blocker_banner_with_and_without_a_lift(self):
+        # D-237: the banner counts what the Status section lists — the blockers left and the moved rows.
+        # (a) the run-74 blocker is kept, and one logic row is moved: two rows, banner count 2.
+        kept = _run_74_state(om_4="open")
+        kept["open_substance_majors"][0]["status"] = "manual_review"
+        blocker = copy.deepcopy(kept["remaining_blocking_issues"][0])
+        self.assertEqual([{"count": "1"}], [row["params"] for row in _blocker_banners(kept)])
+        machine._settle_open_majors(kept, [], 3, lifted=set())  # noqa: SLF001
+        self.assertEqual(2, len(kept["remaining_blocking_issues"]))
+        self.assertEqual(blocker, kept["remaining_blocking_issues"][0])
+        self.assertEqual("forced_exit_on_v3_with_remaining_issues", kept["final_status"])
+        self.assertEqual(["unresolved_blockers", "open_substance_majors"], kept["final_status_reasons"])
+        self.assertEqual([{"count": "2"}], [row["params"] for row in _blocker_banners(kept)])
+
+        # (b) the blocker is lifted, and one logic row is moved: one row, banner count 1.
+        lifted = _run_74_state(om_4="resolved")
+        lifted["open_substance_majors"][0]["status"] = "manual_review"
+        machine._settle_open_majors(lifted, [], 3, lifted={"om-4"})  # noqa: SLF001
+        self.assertEqual(["logic"], [row["source_reviewer"] for row in lifted["remaining_blocking_issues"]])
+        self.assertEqual("forced_exit_on_v3_with_remaining_issues", lifted["final_status"])
+        # Final fix wave (finding 2): no blocker is left, so `unresolved_blockers` goes; the moved row's reason stays.
+        self.assertEqual(["open_substance_majors"], lifted["final_status_reasons"])
+        self.assertEqual([{"count": "1"}], [row["params"] for row in _blocker_banners(lifted)])
+        other = _run_74_state(om_4="resolved")
+        other["final_status_reasons"] = ["unresolved_blockers", OTHER_REASON]
+        other["open_substance_majors"][0]["status"] = "manual_review"
+        machine._settle_open_majors(other, [], 3, lifted={"om-4"})  # noqa: SLF001
+        self.assertEqual([OTHER_REASON, "open_substance_majors"], other["final_status_reasons"])
+
+        # (c) a forced exit with one blocker and its banner, and one moved row: the label is kept, the reason
+        # is added once however often the settlement runs, and the banner counts both rows.
+        forced = {
+            "final_status": "forced_exit_on_v2_with_remaining_issues",
+            "final_status_reasons": ["unresolved_blockers"],
+            "remaining_blocking_issues": [dict(self.BLOCKER)],
+            "fallback_banners": [],
+            "open_substance_majors": [_major("om-1", "counterarguments", status="unresolved")],
+        }
+        review.record_banner(forced, BLOCKER_BANNER, count=1)
+        for _ in range(2):
+            machine._settle_open_majors(forced, [], 2)  # noqa: SLF001
+        self.assertEqual("forced_exit_on_v2_with_remaining_issues", forced["final_status"])
+        self.assertEqual(["unresolved_blockers", "open_substance_majors"], forced["final_status_reasons"])
+        self.assertEqual(2, len(forced["remaining_blocking_issues"]))
+        self.assertEqual([{"count": "2"}], [row["params"] for row in _blocker_banners(forced)])
+
+    def test_a_moved_row_carries_its_client_sentence_and_is_moved_once(self):
+        row = _major("om-1", "citations", status="unresolved", issue_client="Пинпойнт указывает не туда.")
+        current = self.state("approved_on_v1", row)
+        machine._settle_open_majors(current, [], 1)  # noqa: SLF001
+        machine._settle_open_majors(current, [], 1)  # noqa: SLF001
+        self.assertEqual(1, len(current["remaining_blocking_issues"]))
+        moved = current["remaining_blocking_issues"][0]
+        self.assertEqual(
+            ("major", "s-3", "Пинпойнт указывает не туда."),
+            (moved["severity"], moved["section_id"], moved["issue_client"]),
+        )
+
+    def test_an_empty_list_changes_nothing(self):
+        current = self.state("approved_on_v1")
+        before = copy.deepcopy(current)
+        machine._settle_open_majors(current, [], 1)  # noqa: SLF001
+        self.assertEqual(before, current)
+
+
+class DispositionTest(unittest.TestCase):
+    """D-211 pass 1; fix round 1 (2): a duplicated id takes the class default, whatever the order."""
+
+    ROWS = (_major("om-1", "citations"), _major("om-2", "logic"), _major("om-3", "counterarguments"))
+
+    def statuses(self, dispositions: list[tuple[str, str]]) -> list[str]:
+        current = {"open_substance_majors": [dict(row) for row in self.ROWS]}
+        document = {"dispositions": [{"id": row_id, "action": action, "note": "n"} for row_id, action in dispositions]}
+        machine._apply_dispositions(current, document)  # noqa: SLF001
+        return [row["status"] for row in current["open_substance_majors"]]
+
+    def test_each_unique_disposition_is_applied(self):
+        self.assertEqual(
+            ["open", "left", "open"], self.statuses([("om-1", "polish"), ("om-2", "leave"), ("om-3", "polish")])
+        )
+
+    def test_a_duplicated_id_takes_the_class_default_whatever_the_order(self):
+        for first, second in (("polish", "manual_review"), ("manual_review", "polish")):
+            with self.subTest(citations=(first, second)):
+                self.assertEqual(
+                    ["manual_review", "open", "open"],
+                    self.statuses([("om-1", first), ("om-2", "polish"), ("om-1", second), ("om-3", "polish")]),
+                )
+        # D-237 (C2/F4): the class default of a `logic` row is `manual_review`, so the finding stays in view.
+        for first, second in (("polish", "leave"), ("leave", "polish"), ("polish", "polish")):
+            with self.subTest(logic=(first, second)):
+                self.assertEqual(
+                    ["open", "manual_review", "open"],
+                    self.statuses([("om-2", first), ("om-1", "polish"), ("om-3", "polish"), ("om-2", second)]),
+                )
+
+    def test_the_note_of_an_applied_disposition_is_kept_on_the_row(self):
+        # D-216: `summary.md` prints why a row was left; run 74 printed three `left` rows without it.
+        current = {"open_substance_majors": [dict(row) for row in self.ROWS]}
+        document = {
+            "dispositions": [
+                {"id": "om-1", "action": "manual_review", "note": "A lawyer checks  the pinpoint."},
+                {"id": "om-2", "action": "leave", "note": "Fixed in 4.2 of v3."},
+                {"id": "om-3", "action": "polish", "note": "Soften 5.3."},
+            ]
+        }
+        machine._apply_dispositions(current, document)  # noqa: SLF001
+        rows = current["open_substance_majors"]
+        self.assertEqual(
+            ["A lawyer checks  the pinpoint.", "Fixed in 4.2 of v3.", "Soften 5.3."],
+            [row.get("disposition_note") for row in rows],
+        )
+        self.assertEqual(["manual_review", "left", "open"], [row["status"] for row in rows])
+
+    def test_a_disposition_replaced_by_the_class_default_leaves_no_note(self):
+        current = {"open_substance_majors": [dict(row) for row in self.ROWS]}
+        document = {
+            "dispositions": [
+                {"id": "om-1", "action": "leave", "note": "Out of the class."},
+                {"id": "om-2", "action": "leave", "note": "First."},
+                {"id": "om-2", "action": "leave", "note": "Second."},
+            ]
+        }
+        machine._apply_dispositions(current, document)  # noqa: SLF001
+        self.assertEqual([None, None, None], [row.get("disposition_note") for row in current["open_substance_majors"]])
+        # D-237 (C2/F4): the duplicated `logic` id takes the class default, now `manual_review`, so a
+        # disposition the machine cannot read shows the finding instead of hiding it.
+        self.assertEqual(
+            ["manual_review", "manual_review", "manual_review"],
+            [row["status"] for row in current["open_substance_majors"]],
+        )
+
+    def test_a_missing_disposition_sends_a_logic_or_counterarguments_row_to_manual_review(self):
+        # D-237 (C2/F4): a missing row shows the finding; an explicit `leave` works as before.
+        self.assertEqual(["manual_review", "manual_review", "manual_review"], self.statuses([]))
+        self.assertEqual(
+            ["manual_review", "left", "left"], self.statuses([("om-2", "leave"), ("om-3", "leave")])
+        )
+        self.assertEqual(
+            ["manual_review", "manual_review", "manual_review"],
+            self.statuses([("om-1", "manual_review"), ("om-2", "manual_review"), ("om-3", "manual_review")]),
+        )
+
+    def test_unique_by_id_drops_every_row_of_a_duplicated_id(self):
+        rows = [
+            {"id": "om-1", "status": "open"},
+            {"id": "om-2", "status": "resolved"},
+            {"id": "om-1", "status": "resolved"},
+        ]
+        self.assertEqual({"om-2": "resolved"}, machine._unique_by_id(rows, "status"))  # noqa: SLF001
+        self.assertEqual({}, machine._unique_by_id(None, "status"))  # noqa: SLF001
+
+
+class ExportPinTest(unittest.TestCase):
+    """D-211; fix round 1 (3): the pin names a version and its sha, not whichever version holds the bytes."""
+
+    SHA = "a" * 64
+
+    def state(self) -> dict:
+        return {
+            "draft_versions": [
+                {"version": 1, "path": "drafts/v1.md", "sha256": self.SHA, "lint_clean": True},
+                {"version": 3, "path": "drafts/v3.md", "sha256": self.SHA, "lint_clean": False},
+            ],
+            "current_draft_path": "drafts/v3.md",
+        }
+
+    def test_the_pinned_version_wins_over_an_older_one_with_the_same_bytes(self):
+        state = self.state()
+        self.assertEqual(("drafts/v1.md",), machine.export_inputs(Path("."), state, self.SHA))
+        pinned = dict(state, export_pin={"version": 3, "sha256": self.SHA})
+        self.assertEqual((self.SHA, 3), machine.export_draft_sha(pinned))
+        self.assertEqual(("drafts/v3.md",), machine.export_inputs(Path("."), pinned, self.SHA))
+
+
+class OpenFindingsTextTest(unittest.TestCase):
+    """D-211: `${open_findings}` — one line per row, not gated on the draft sha, statuses after the polish."""
+
+    def test_no_rows_is_none(self):
+        self.assertEqual("none", machine.open_findings_text({}))
+        self.assertEqual("none", machine.open_findings_text({"open_substance_majors": []}))
+
+    def test_one_line_per_row_before_the_polish(self):
+        rows = [_major("om-1", "citations"), _major("om-2", "logic", "s-10-3")]
+        text = machine.open_findings_text({"open_substance_majors": rows, "current_draft_sha": "c" * 64})
+        self.assertEqual([_finding_line(row) for row in rows], text.splitlines())
+
+    def test_after_the_polish_the_status_is_appended_and_recheck_rows_are_for_information(self):
+        rows = [
+            _major("om-1", "citations", status="resolved"),
+            _major("om-2", "citations", origin="recheck"),
+        ]
+        text = machine.open_findings_text({"open_substance_majors": rows, "attempts": {"client_polish": 1}})
+        self.assertEqual(
+            [
+                _finding_line(rows[0]) + " · status: resolved",
+                _finding_line(rows[1]) + " · raised by the polish re-check (for information, no disposition)",
+            ],
+            text.splitlines(),
+        )
+
+
+class StateFieldsOfTheReadinessStepTest(unittest.TestCase):
+    """D-211: `export_pin` and `polish_check` are optional, closed state fields."""
+
+    def _state(self) -> dict:
+        driver = Driver(temp_root(self), slug="om-schema")
+        return driver.state()
+
+    def test_both_are_optional_and_closed(self):
+        state = self._state()
+        self.assertEqual([], schema.validate(state, "state"))
+        good = dict(
+            state,
+            export_pin={"version": 2, "sha256": "a" * 64},
+            polish_check={"draft_sha": "b" * 64, "errors": ["section_out_of_scope: s-2"]},
+        )
+        self.assertEqual([], schema.validate(good, "state"))
+        for field, value in (
+            ("export_pin", {"version": 2, "sha256": "a" * 64, "extra": 1}),
+            ("export_pin", {"version": 0, "sha256": "a" * 64}),
+            ("export_pin", {"version": 2, "sha256": "short"}),
+            ("polish_check", {"draft_sha": "b" * 64}),
+            ("polish_check", {"draft_sha": "b" * 64, "errors": [1]}),
+        ):
+            with self.subTest(field=field, value=value):
+                self.assertTrue(schema.validate(dict(state, **{field: value}), "state"))
+
+
+# --- D-213: the last blocker goes to the last reader ------------------------------------------
+
+RUN_20260922 = Path(__file__).resolve().parent / "fixtures" / "run-20260922"
+"""The 2026-09-22 run (run 74): `iterations[]` and the state fields at its end."""
+
+BLOCKER_BANNER = "max_iterations_with_blockers"
+UNRESOLVED_TEXT = "REVIEWER NOTES NOT FULLY RESOLVED"
+UNRESOLVED_REASON_TEXT = "blocking reviewer notes remain unresolved"
+"""The `unresolved_blockers` reason as the docx banner's reasons list prints it (D-197)."""
+
+OTHER_REASON = "incomplete_review"
+OTHER_BANNER = "lint_not_converged"
+"""A reason and a banner that are not the blocker's: the settlement keeps both (D-213)."""
+
+
+def _run_74(name: str):
+    return json.loads((RUN_20260922 / name).read_text(encoding="utf-8-sig"))
+
+
+def _run_74_state(om_4: str | None = "open") -> dict:
+    """Run 74 at the end of iteration 3: the three majors left, the s-4-2 blocker and, unless None, its row."""
+    records = _run_74("state-iterations.json")
+    ending = _run_74("state-exit.json")
+    rows = copy.deepcopy(ending["open_substance_majors"])
+    if om_4 is not None:
+        rows += [dict(row, status=om_4) for row in review.blocker_rows(records[2], len(rows) + 1)]
+    return {
+        "iterations": records,
+        "current_draft_sha": records[2]["draft_sha"],
+        "final_status": ending["final_status"],
+        "final_status_reasons": list(ending["final_status_reasons"]),
+        "remaining_blocking_issues": copy.deepcopy(ending["remaining_blocking_issues"]),
+        "fallback_banners": copy.deepcopy(ending["fallback_banners"]),
+        "open_substance_majors": rows,
+    }
+
+
+def _blocker_banners(state: dict) -> list[dict]:
+    return [row for row in state.get("fallback_banners") or [] if row.get("condition_key") == BLOCKER_BANNER]
+
+
+class LastBlockerSettlementTest(unittest.TestCase):
+    """D-213: the readiness texts and the settlement on the run-74 state (1 citations blocker, 3 majors)."""
+
+    def test_known_blockers_leave_out_the_blocker_a_row_links(self):
+        state = _run_74_state()
+        sha = state["current_draft_sha"]
+        self.assertEqual(machine.KNOWN_BLOCKERS_NONE, machine.known_blockers_text(state, sha))
+        unlinked = _run_74_state(om_4=None)
+        text = machine.known_blockers_text(unlinked, sha)
+        self.assertIn("1 blocking issue(s)", text)
+        self.assertIn("s-4-2 · rule_not_in_source", text)
+
+    def test_open_findings_mark_the_blocker_row(self):
+        state = _run_74_state()
+        row = state["open_substance_majors"][3]
+        lines = machine.open_findings_text(state).splitlines()
+        self.assertEqual(4, len(lines))
+        self.assertEqual(
+            f"- om-4 · citations · blocker · s-4-2 · {row['issue']} · {row['suggestion']}", lines[3]
+        )
+        self.assertEqual(_finding_line(state["open_substance_majors"][0]), lines[0])
+
+    def test_a_lifted_blocker_turns_the_forced_exit_into_approved(self):
+        state = _run_74_state(om_4="resolved")
+        machine._settle_open_majors(state, [], 3, lifted={"om-4"})  # noqa: SLF001
+        self.assertEqual([], state["remaining_blocking_issues"])
+        self.assertEqual("approved_on_v3", state["final_status"])
+        self.assertEqual([], state["final_status_reasons"])
+        self.assertEqual([], _blocker_banners(state))
+        self.assertEqual(
+            ["left", "left", "left", "resolved"], [row["status"] for row in state["open_substance_majors"]]
+        )
+
+    def test_a_blocker_without_evidence_is_kept_verbatim(self):
+        ending = _run_74("state-exit.json")
+        for saved in ("open", "resolved"):
+            with self.subTest(saved=saved):
+                state = _run_74_state(om_4=saved)
+                banners = copy.deepcopy(state["fallback_banners"])
+                machine._settle_open_majors(state, [], 3, lifted=set())  # noqa: SLF001
+                self.assertEqual(ending["remaining_blocking_issues"], state["remaining_blocking_issues"])
+                self.assertEqual("forced_exit_on_v3_with_remaining_issues", state["final_status"])
+                self.assertEqual(["unresolved_blockers"], state["final_status_reasons"])
+                self.assertEqual(banners, state["fallback_banners"])
+                self.assertEqual("unresolved", state["open_substance_majors"][3]["status"])
+        state = _run_74_state(om_4="manual_review")
+        machine._settle_open_majors(state, [], 3)  # noqa: SLF001
+        self.assertEqual(ending["remaining_blocking_issues"], state["remaining_blocking_issues"])
+        self.assertEqual("manual_review", state["open_substance_majors"][3]["status"])
+        self.assertEqual(["unresolved_blockers"], state["final_status_reasons"])
+
+    def test_two_blockers_one_lifted_recount_the_banner_and_keep_the_label(self):
+        state = _run_74_state(om_4="resolved")
+        second = dict(state["remaining_blocking_issues"][0], section_id="s-5-4", issue="A second unsupported rule.")
+        state["remaining_blocking_issues"].append(second)
+        state["open_substance_majors"] += [
+            dict(row, id="om-5", status="unresolved")
+            for row in review.blocker_rows({"iteration": 3, "issues": [second]}, 5)
+        ]
+        state["fallback_banners"] = [dict(state["fallback_banners"][0], params={"count": "2"})]
+        machine._settle_open_majors(state, [], 3, lifted={"om-4"})  # noqa: SLF001
+        self.assertEqual([second], state["remaining_blocking_issues"])
+        self.assertEqual("forced_exit_on_v3_with_remaining_issues", state["final_status"])
+        self.assertEqual(["unresolved_blockers"], state["final_status_reasons"])
+        banners = _blocker_banners(state)
+        self.assertEqual([{"count": "1"}], [row["params"] for row in banners])
+        self.assertIn("1 blocking issue(s)", banners[0]["text"])
+
+    def test_another_reason_keeps_the_label_and_drops_only_the_lifted_blocker(self):
+        # D-243: the other reason was the removed `length_overflow`; any reason but the blocker's serves.
+        state = _run_74_state(om_4="resolved")
+        state["final_status"] = "manual_review_required_on_v3"
+        state["final_status_reasons"] = ["unresolved_blockers", OTHER_REASON]
+        review.record_banner(state, OTHER_BANNER)
+        machine._settle_open_majors(state, [], 3, lifted={"om-4"})  # noqa: SLF001
+        self.assertEqual([], state["remaining_blocking_issues"])
+        self.assertEqual("manual_review_required_on_v3", state["final_status"])
+        self.assertEqual([OTHER_REASON], state["final_status_reasons"])
+        self.assertEqual([], _blocker_banners(state))
+        self.assertEqual(
+            [OTHER_BANNER], [row["condition_key"] for row in state["fallback_banners"]]
+        )
+
+        # Fix round 1: a blocker still left keeps the reason that says so.
+        state = _run_74_state(om_4="resolved")
+        second = dict(state["remaining_blocking_issues"][0], section_id="s-5-4", issue="A second unsupported rule.")
+        state["remaining_blocking_issues"].append(second)
+        state["open_substance_majors"] += review.blocker_rows({"iteration": 3, "issues": [second]}, 5)
+        state["final_status"] = "manual_review_required_on_v3"
+        state["final_status_reasons"] = ["unresolved_blockers", OTHER_REASON]
+        machine._settle_open_majors(state, [], 3, lifted={"om-4"})  # noqa: SLF001
+        self.assertEqual([second], state["remaining_blocking_issues"])
+        self.assertEqual(["unresolved_blockers", OTHER_REASON], state["final_status_reasons"])
+
+        state = _run_74_state(om_4="resolved")
+        recheck = {"severity": "blocker", "category": "unsupported_law", "section_id": "s-1", "issue": "No rule."}
+        machine._settle_open_majors(state, [recheck], 3, lifted={"om-4"})  # noqa: SLF001
+        self.assertEqual([recheck], state["remaining_blocking_issues"])
+        self.assertEqual("forced_exit_on_v3_with_remaining_issues", state["final_status"])
+        self.assertEqual(["unresolved_blockers", "polish_recheck_blocker"], state["final_status_reasons"])
+        self.assertEqual([{"count": "1"}], [row["params"] for row in _blocker_banners(state)])
+
+    def test_a_state_written_before_d213_settles_exactly_as_today(self):
+        before = _run_74_state(om_4=None)
+        today = copy.deepcopy(before)
+        machine._settle_open_majors(today, [], 3)  # noqa: SLF001
+        lifted = copy.deepcopy(before)
+        machine._settle_open_majors(lifted, [], 3, lifted={"om-1", "om-2", "om-3"})  # noqa: SLF001
+        self.assertEqual(today, lifted)
+        self.assertEqual(before["remaining_blocking_issues"], lifted["remaining_blocking_issues"])
+        self.assertEqual("forced_exit_on_v3_with_remaining_issues", lifted["final_status"])
+
+
+def _last_blocker(text: str = "The rule in section 3 is not in the cited article.") -> dict:
+    """A `citations`/`unsupported_claim` blocker on s-3, as the aggregate stores it."""
+    return review._normalize_issue(  # noqa: SLF001 - the stored shape of an aggregated issue
+        {
+            "severity": "blocker",
+            "category": "rule_not_in_source",
+            "section_id": "s-3",
+            "issue": text,
+            "suggestion": "Withdraw the statement or qualify it as unresolved.",
+            "checklist_id": "CIT-01",
+            "issue_category": "unsupported_claim",
+        },
+        "citations",
+    )
+
+
+WITHDRAW_S3 = {
+    "section_id": "s-3",
+    "severity": "blocker",
+    "issue": "The rule in section 3 is not in the cited article.",
+    "suggestion": (
+        "Withdraw or qualify the statement and every risk line or summary bullet that rests on it; "
+        "no new norm, no new source."
+    ),
+}
+"""The readiness issue a `polish` disposition of a blocker row in s-3 turns into (D-213)."""
+
+SUMMARY_EDIT = (
+    "- Records may not be kept beyond the purpose that justified them.",
+    "- Records may not be kept beyond the purpose that justified them, as section 3 states.",
+)
+"""A polish edit of the s-1 summary bullet that rests on the s-3 statement (gate R1-2)."""
+
+BLOCKER_SCOPE_NOTE = (
+    "The resolution of a blocker finding covers every statement in these sections that rests on it: "
+    "record it `resolved` only if none of them still carries the withdrawn statement."
+)
+
+
+class LastBlockerReadinessTest(unittest.TestCase):
+    """D-213: a blocker row is polished, re-checked and lifted only on the evidence at the export."""
+
+    def _forced_readiness(self, slug: str, blockers: list[dict], *, status=None, reasons=None, banners=()) -> tuple:
+        """Readiness pass 1 of a run that left the loop on the forced exit of v1 with `blockers` as rows."""
+        rows = review.blocker_rows({"iteration": 1, "issues": blockers}, 1)
+        driver, first = _to_readiness(self, slug, rows)
+
+        def forced(current: dict) -> None:
+            current["final_status"] = status or "forced_exit_on_v1_with_remaining_issues"
+            current["final_status_reasons"] = list(reasons or ["unresolved_blockers"])
+            current["remaining_blocking_issues"] = copy.deepcopy(blockers)
+            review.record_banner(current, BLOCKER_BANNER, count=len(blockers))
+            for key in banners:
+                review.record_banner(current, key)
+
+        state_io.write_state(driver.work_dir, forced)
+        return driver, first, rows
+
+    def _to_recheck(self, slug: str, blockers: list[dict], *, edit=None, **forced) -> tuple:
+        """Pass 1 polishes every blocker row, the fixture writer edits s-3; stop on the re-check dispatch."""
+        driver, first, rows = self._forced_readiness(slug, blockers, **forced)
+        dispositions = [(row["id"], "polish") for row in rows]
+        _answer(
+            driver,
+            first,
+            _readiness_document(driver, "needs_final_polish", issues=[WITHDRAW_S3], dispositions=dispositions),
+        )
+        _act_writer(driver, driver.next(), edit=edit)
+        return driver, first, _next_dispatch_of(driver, "citation-auditor")
+
+    @staticmethod
+    def _delivered(driver: Driver) -> tuple[str, str]:
+        """The md view and the docx text of the delivered memo."""
+        state = driver.state()
+        memo = docx_export.memo_md_path(driver.work_dir, docx_export.slug_of(state, driver.work_dir))
+        with zipfile.ZipFile(driver.work_dir / "deliverable.docx") as archive:
+            docx = archive.read("word/document.xml").decode("utf-8")
+        return memo.read_text(encoding="utf-8"), docx
+
+    def test_a_clean_recheck_lifts_the_blocker_and_approves(self):
+        blocker = _last_blocker()
+        driver, first, recheck = self._to_recheck("lb-lifted", [blocker])
+        self.assertIn(
+            f"- om-1 · citations · blocker · s-3 · {blocker['issue']} · {blocker['suggestion']}\n",
+            first["agents"][0]["prompt"],
+        )
+        self.assertIn(
+            "Scope: sections s-3; the open findings om-1 · citations · blocker · ", recheck["agents"][0]["prompt"]
+        )
+        _answer(driver, recheck, _recheck_document(driver, resolutions=[("om-1", "resolved")]))
+        second = driver.next()
+        self.assertTrue(second["agents"][0]["subagent_type"].endswith("client-readiness-reviewer"))
+        driver.act(second)  # the fixture reviewer answers `client_ready`
+        driver.run_to_end()
+
+        state = driver.state()
+        self.assertEqual([], state["remaining_blocking_issues"])
+        self.assertEqual("approved_on_v1", state["final_status"])
+        self.assertEqual([], state["final_status_reasons"])
+        self.assertEqual([], _blocker_banners(state))
+        self.assertEqual("resolved", _row(state, "om-1")["status"])
+        self.assertEqual([], schema.validate(state, "state"))
+        memo, docx = self._delivered(driver)
+        self.assertNotIn(UNRESOLVED_TEXT, memo)
+        self.assertNotIn(UNRESOLVED_TEXT, docx)
+        summary = (driver.work_dir / "summary.md").read_text(encoding="utf-8")
+        self.assertEqual(0, summary.count(blocker["issue"]))
+
+    def test_an_open_resolution_keeps_the_blocker_and_the_label(self):
+        blocker = _last_blocker()
+        driver, _, recheck = self._to_recheck("lb-open", [blocker])
+        _answer(driver, recheck, _recheck_document(driver, resolutions=[("om-1", "open")]))
+        driver.run_to_end()
+        state = driver.state()
+        self.assertEqual([blocker], state["remaining_blocking_issues"], "kept verbatim, no moved major")
+        self.assertEqual("forced_exit_on_v1_with_remaining_issues", state["final_status"])
+        self.assertEqual(["unresolved_blockers"], state["final_status_reasons"])
+        self.assertEqual("unresolved", _row(state, "om-1")["status"])
+        summary = (driver.work_dir / "summary.md").read_text(encoding="utf-8")
+        self.assertEqual(1, summary.count(blocker["issue"]))
+        self.assertIn("## Open reviewer findings\n\n- none\n", summary)
+
+    def test_manual_review_keeps_the_blocker_and_the_label(self):
+        blocker = _last_blocker()
+        driver, first, _ = self._forced_readiness("lb-manual", [blocker])
+        _answer(driver, first, _readiness_document(driver, "client_ready", dispositions=[("om-1", "manual_review")]))
+        driver.next()
+        state = driver.state()
+        self.assertEqual("export", state["current_phase"])
+        self.assertEqual([blocker], state["remaining_blocking_issues"])
+        self.assertEqual("forced_exit_on_v1_with_remaining_issues", state["final_status"])
+        self.assertEqual(["unresolved_blockers"], state["final_status_reasons"])
+        self.assertEqual("manual_review", _row(state, "om-1")["status"])
+
+    def test_a_new_source_token_restores_the_baseline_and_keeps_the_blocker(self):
+        blocker = _last_blocker()
+        driver, first, _ = self._forced_readiness("lb-token", [blocker])
+        baseline_sha = state_io.sha256_bytes((driver.work_dir / "drafts/v1.md").read_bytes())
+        _answer(
+            driver,
+            first,
+            _readiness_document(driver, "needs_final_polish", issues=[WITHDRAW_S3], dispositions=[("om-1", "polish")]),
+        )
+        _act_writer(
+            driver,
+            driver.next(),
+            edit=("exceeds that period (v1 review).", "exceeds that period (v1 review) [[src:tax-code s 147]]."),
+        )
+        render = driver.next()
+        self.assertEqual("docx.render", machine.command_key(render["command"]))
+        state = driver.state()
+        self.assertEqual(["new_source_token: s-3: tax-code"], state["polish_check"]["errors"])
+        self.assertEqual({"version": 1, "sha256": baseline_sha}, state["export_pin"])
+        self.assertEqual(baseline_sha, state_io.sha256_bytes((driver.work_dir / "drafts/v1.md").read_bytes()))
+        self.assertEqual([blocker], state["remaining_blocking_issues"])
+        self.assertEqual("forced_exit_on_v1_with_remaining_issues", state["final_status"])
+        self.assertEqual(["unresolved_blockers", "polish_out_of_scope"], state["final_status_reasons"])
+        self.assertEqual("unresolved", _row(state, "om-1")["status"])
+
+    def test_a_cancel_after_a_clean_recheck_keeps_the_blocker_and_the_label(self):
+        blocker = _last_blocker()
+        driver, _, recheck = self._to_recheck("lb-cancel", [blocker])
+        _answer(driver, recheck, _recheck_document(driver, resolutions=[("om-1", "resolved")]))
+        second = driver.next()
+        self.assertTrue(second["agents"][0]["subagent_type"].endswith("client-readiness-reviewer"))
+        self.assertEqual("resolved", _row(driver.state(), "om-1")["status"])
+        state_io.write_state(driver.work_dir, lambda current: current.update({"cancel_requested": True}))
+        driver.run_to_end()
+        state = driver.state()
+        self.assertEqual("cancelled_by_user", state["current_phase"])
+        self.assertEqual([blocker], state["remaining_blocking_issues"])
+        self.assertEqual("forced_exit_on_v1_with_remaining_issues", state["final_status"])
+        self.assertEqual("unresolved", _row(state, "om-1")["status"])
+
+    def test_a_recheck_drifted_after_pass_2_lifts_nothing(self):
+        blocker = _last_blocker()
+        driver, _, recheck = self._to_recheck("lb-drift", [blocker])
+        _answer(driver, recheck, _recheck_document(driver, resolutions=[("om-1", "resolved")]))
+        second = driver.next()
+        self.assertEqual("resolved", _row(driver.state(), "om-1")["status"], "saved by pass 2")
+        published = driver.work_dir / review.review_path(1, "citations_polish")
+        published.write_bytes(published.read_bytes() + b"\n")
+        driver.act(second)
+        driver.run_to_end()
+        state = driver.state()
+        self.assertEqual([blocker], state["remaining_blocking_issues"])
+        self.assertEqual("forced_exit_on_v1_with_remaining_issues", state["final_status"])
+        self.assertEqual("unresolved", _row(state, "om-1")["status"])
+
+    def test_an_export_pinned_to_other_bytes_lifts_nothing(self):
+        blocker = _last_blocker()
+        driver, _, recheck = self._to_recheck("lb-pin", [blocker])
+        _answer(driver, recheck, _recheck_document(driver, resolutions=[("om-1", "resolved")]))
+        second = driver.next()
+        baseline = stepctx.published_entry(driver.state(), PREPOLISH_V1)["sha256"]
+        state_io.write_state(
+            driver.work_dir, lambda current: current.update({"export_pin": {"version": 1, "sha256": baseline}})
+        )
+        driver.act(second)
+        driver.next()  # pass 2 answers `client_ready`: the transition to `export` settles
+        state = driver.state()
+        self.assertEqual("export", state["current_phase"])
+        self.assertEqual([blocker], state["remaining_blocking_issues"])
+        self.assertEqual("forced_exit_on_v1_with_remaining_issues", state["final_status"])
+        self.assertEqual("unresolved", _row(state, "om-1")["status"])
+
+    def test_the_recheck_scope_takes_in_the_changed_summary_bullet(self):
+        recheck_blocker = {
+            "severity": "blocker",
+            "category": "unsupported_law",
+            "section_id": "s-1",
+            "issue": "The summary bullet still states the withdrawn rule.",
+            "suggestion": "Withdraw it.",
+            "checklist_id": "CIT-01",
+            "issue_category": "unsupported_claim",
+        }
+        cases = (
+            ("the resolution is open", [("om-1", "open")], []),
+            ("a re-check blocker sits in the summary", [("om-1", "resolved")], [recheck_blocker]),
+        )
+        for label, resolutions, issues in cases:
+            with self.subTest(case=label):
+                blocker = _last_blocker()
+                driver, _, recheck = self._to_recheck(f"lb-scope-{len(issues)}", [blocker], edit=SUMMARY_EDIT)
+                prompt = recheck["agents"][0]["prompt"]
+                self.assertIn("Scope: sections s-1, s-3; the open findings om-1 · citations · blocker · ", prompt)
+                self.assertIn(BLOCKER_SCOPE_NOTE, prompt)
+                failed = ("CIT-01",) if issues else ()
+                document = _recheck_document(driver, resolutions=resolutions, issues=issues, failed=failed)
+                _answer(driver, recheck, document)
+                driver.run_to_end()
+                state = driver.state()
+                self.assertEqual("unresolved", _row(state, "om-1")["status"])
+                self.assertEqual(blocker, state["remaining_blocking_issues"][0])
+                self.assertEqual("forced_exit_on_v1_with_remaining_issues", state["final_status"])
+
+    def test_two_blockers_one_lifted_leave_one_counted_in_the_banner(self):
+        kept = _last_blocker("The second rule in section 3 is not in the cited article either.")
+        driver, _, recheck = self._to_recheck("lb-two", [_last_blocker(), kept])
+        _answer(driver, recheck, _recheck_document(driver, resolutions=[("om-1", "resolved"), ("om-2", "open")]))
+        driver.run_to_end()
+        state = driver.state()
+        self.assertEqual([kept], state["remaining_blocking_issues"])
+        self.assertEqual("forced_exit_on_v1_with_remaining_issues", state["final_status"])
+        self.assertEqual(["unresolved_blockers"], state["final_status_reasons"])
+        self.assertEqual(
+            [("resolved", "om-1"), ("unresolved", "om-2")],
+            [(row["status"], row["id"]) for row in state["open_substance_majors"]],
+        )
+        self.assertEqual([{"count": "1"}], [row["params"] for row in _blocker_banners(state)])
+        status = md_fallback.render_status(md_fallback.status_inputs(state))
+        memo, docx = self._delivered(driver)
+        for text in (status, memo, docx):
+            self.assertIn("1 blocking issue(s)", text)
+            self.assertNotIn("2 blocking issue(s)", text)
+
+    def test_another_reason_keeps_its_label_and_loses_the_blocker_banner(self):
+        # D-243: the other reason was the removed `length_overflow`.
+        blocker = _last_blocker()
+        driver, _, recheck = self._to_recheck(
+            "lb-other",
+            [blocker],
+            status="manual_review_required_on_v1",
+            reasons=["unresolved_blockers", OTHER_REASON],
+            banners=(OTHER_BANNER,),
+        )
+        _answer(driver, recheck, _recheck_document(driver, resolutions=[("om-1", "resolved")]))
+        driver.run_to_end()
+        state = driver.state()
+        self.assertEqual([], state["remaining_blocking_issues"])
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+        # Fix round 1: the list is empty, so the reason that says blockers remain goes; the other one stays.
+        self.assertEqual([OTHER_REASON], state["final_status_reasons"])
+        self.assertEqual([], _blocker_banners(state))
+        status = md_fallback.render_status(md_fallback.status_inputs(state))
+        memo, docx = self._delivered(driver)
+        summary = (driver.work_dir / "summary.md").read_text(encoding="utf-8")
+        for text in (status, memo, docx, summary):
+            self.assertNotIn(UNRESOLVED_TEXT, text)
+            self.assertNotIn(UNRESOLVED_REASON_TEXT, text)
+            self.assertNotIn("unresolved_blockers", text)
+        self.assertIn(md_fallback.reason_name(OTHER_REASON), docx)
+
+    def test_another_reason_with_a_blocker_left_keeps_the_unresolved_reason(self):
+        kept = _last_blocker("The second rule in section 3 is not in the cited article either.")
+        driver, _, recheck = self._to_recheck(
+            "lb-other-partial",
+            [_last_blocker(), kept],
+            status="manual_review_required_on_v1",
+            reasons=["unresolved_blockers", OTHER_REASON],
+            banners=(OTHER_BANNER,),
+        )
+        _answer(driver, recheck, _recheck_document(driver, resolutions=[("om-1", "resolved"), ("om-2", "open")]))
+        driver.run_to_end()
+        state = driver.state()
+        self.assertEqual([kept], state["remaining_blocking_issues"])
+        self.assertEqual("manual_review_required_on_v1", state["final_status"])
+        self.assertEqual(["unresolved_blockers", OTHER_REASON], state["final_status_reasons"])
+        self.assertEqual([{"count": "1"}], [row["params"] for row in _blocker_banners(state)])
+        _, docx = self._delivered(driver)
+        self.assertIn(UNRESOLVED_REASON_TEXT, docx)
+        self.assertIn("1 blocking issue(s)", docx)
+
+    def test_a_disposition_note_and_an_old_row_both_pass_the_state_schema(self):
+        driver = Driver(temp_root(self), slug="lb-schema")
+        row = review.blocker_rows({"iteration": 1, "issues": [_last_blocker()]}, 2)[0]
+        rows = [_major("om-1", "logic"), dict(row, status="manual_review", disposition_note="A lawyer checks it.")]
+        state = dict(driver.state(), open_substance_majors=rows)
+        self.assertEqual([], schema.validate(state, "state"))
+        state["open_substance_majors"][1]["blocker_of"]["extra"] = 1
+        self.assertTrue(schema.validate(state, "state"))
+
+
+class MachineWarningLanguageTest(unittest.TestCase):
+    """D-175: the three code-written `machine.py` warnings are created in the memo language."""
+
+    RU_WARNINGS = {
+        "memo.warnings.no_findings_for_layers": "нет находок по слоям: {layers}",
+        "memo.warnings.continue_with_incomplete_research": (
+            "пользователь решил продолжить при неполном исследовании"
+        ),
+        "memo.warnings.currency_unchecked": "актуальность источника не удалось проверить",
+    }
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.packs = self.root / "packs"
+        self.packs.mkdir()
+        patcher = mock.patch.object(machine.i18n, "PACK_DIR", self.packs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        _i18n.fake_pack(self.packs, "ru", self.RU_WARNINGS)
+
+    def _state(self, phase: str) -> tuple:
+        from memoforge import modes, state_io, task as _task
+
+        work_dir = self.root / f"memo-20260908T120000Z-w-{phase.replace('_', '-')}"
+        _task.create_work_dir_tree(work_dir)
+        state = _task.build_initial_state(
+            task_id=work_dir.name,
+            user_query="How long may the client keep customer records?",
+            language="ru",
+            work_dir=work_dir,
+            output_folder=self.root,
+            config=modes.resolve_config("full"),
+        )
+        state["current_phase"] = phase
+        state_io.create_state(work_dir, state)
+        return work_dir, state
+
+    def test_a_partially_failed_research_dispatch_warns_in_russian(self):
+        work_dir, state = self._state("research")
+        slot = {
+            "slot": "doctrine",
+            "status": "fail",
+            "attempt": 1,
+            "agent_type": "memoforge:legal-researcher",
+        }
+        other = {
+            "slot": "statutes",
+            "status": "ok",
+            "attempt": 1,
+            "agent_type": "memoforge:legal-researcher",
+        }
+        step_id = "s-001"
+
+        def seed(current: dict) -> None:
+            current["current_phase"] = "research"
+            current["steps"] = [
+                {
+                    "step_id": step_id,
+                    "kind": "dispatch",
+                    "phase": "research",
+                    "attempt": 1,
+                    "reason": "initial",
+                    "status": "ok",
+                    "agents": [slot, other],
+                }
+            ]
+
+        machine.state_io.write_state(work_dir, seed)
+        machine.plan_research(work_dir, machine.state_io.read_state(work_dir))
+        warnings = machine.state_io.read_state(work_dir)["drafting_warnings"]
+        found = [row for row in warnings if row["code"] == "research_layer_missing"]
+        self.assertEqual(1, len(found), warnings)
+        self.assertEqual("нет находок по слоям: doctrine", found[0]["message"])
+        self.assertEqual("research_sufficiency", machine.state_io.read_state(work_dir)["current_phase"])
+
+    def test_accepting_insufficient_research_warns_in_russian(self):
+        work_dir, state = self._state("research_insufficient_pending")
+        gate = machine.plan_research_insufficient_pending(
+            work_dir, machine.state_io.read_state(work_dir)
+        )
+        self.assertEqual("gate-text", gate["kind"])
+        machine.gates.run_parse(
+            namespace(
+                workdir=str(work_dir), gate=None, text="continue",
+                step=gate["step_id"], attempt=gate["attempt"], generation=0,
+            )
+        )
+        machine.run_next(namespace(workdir=str(work_dir)))
+        warnings = machine.state_io.read_state(work_dir)["drafting_warnings"]
+        found = [row for row in warnings if row["code"] == "insufficient_research_accepted"]
+        self.assertEqual(1, len(found), warnings)
+        self.assertEqual(
+            "пользователь решил продолжить при неполном исследовании", found[0]["message"]
+        )
+
+    def test_an_unavailable_currency_checker_warns_in_russian(self):
+        work_dir, state = self._state("currency_check")
+
+        def seed(current: dict) -> None:
+            current["current_phase"] = "currency_check"
+            agent = {
+                "slot": "currency",
+                "status": "fail",
+                "attempt": 1,
+                "agent_type": "memoforge:currency-checker",
+            }
+            current["steps"] = [
+                {
+                    "step_id": "s-010",
+                    "kind": "dispatch",
+                    "phase": "currency_check",
+                    "attempt": 1,
+                    "reason": "initial",
+                    "status": "fail",
+                    "agents": [agent],
+                }
+            ]
+
+        machine.state_io.write_state(work_dir, seed)
+        machine.plan_currency_check(work_dir, machine.state_io.read_state(work_dir))
+        # The failure writes the unchecked report, the warning and the currency gate answer.
+        gate = machine.run_next(namespace(workdir=str(work_dir)))
+        while gate["kind"] == "script":
+            machine.run_command(list(gate["command"]))
+            gate = machine.run_next(namespace(workdir=str(work_dir)))
+        warnings = machine.state_io.read_state(work_dir)["drafting_warnings"]
+        found = [row for row in warnings if row["code"] == "currency_unchecked"]
+        self.assertEqual(1, len(found), warnings)
+        self.assertEqual("актуальность источника не удалось проверить", found[0]["message"])
+
+
+class UiLanguageGateTest(unittest.TestCase):
+    """D-176 / D-176a: the gates `next` issues speak the UI language; the answers stay canonical."""
+
+    def setUp(self):
+        self.packs = Path(temp_root(self)) / "packs"
+        self.packs.mkdir()
+        patcher = mock.patch.object(machine.i18n, "PACK_DIR", self.packs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        _i18n.fake_pack(self.packs, "ru", _i18n.RU_UI)
+
+    def _russian_task(self, slug: str) -> Driver:
+        driver = Driver(temp_root(self), slug=slug)
+        state_io.write_state(
+            driver.work_dir, lambda current: current.update({"ui_language": "ru"})
+        )
+        return driver
+
+    def _with_dashboard(self, driver: Driver) -> dict:
+        """The state of a run whose page is live, so the gates print the pointer form (D-94)."""
+        state = dict(driver.state())
+        state["config"] = dict(state.get("config") or {}, dashboard=True)
+        state["progress"] = dict(state.get("progress") or {}, artifact_url="https://example.test/x")
+        return state
+
+    def test_a_localized_auq_answer_is_recorded_canonically_and_the_run_proceeds(self):
+        driver = self._russian_task("ui-auq")
+        action = driver.run_until("plan_approval_pending")
+        self.assertEqual("gate-auq", action["kind"])
+        answer = driver.report(
+            action["step_id"],
+            action["attempt"],
+            answers=json.dumps({"План": "Утвердить", "Стиль": "standard"}),
+            generation=action.get("generation", 0),
+        )
+        self.assertTrue(answer["accepted"])
+        iteration = driver.state()["plan_approval"]["iterations"][-1]
+        self.assertEqual({"Plan": "Approve", "Style": "standard"}, iteration["answers"])
+        self.assertEqual("approved", driver.state()["plan_approval"]["status"])
+        driver.next()
+        self.assertEqual("research", driver.state()["current_phase"])
+        self.assertEqual("full", driver.state()["mode"])
+
+    def test_resume_gate_reissues_the_plan_gate_in_russian(self):
+        driver = self._russian_task("ui-resume")
+        issued = driver.run_until("plan_approval_pending")
+        reissued = driver.next()
+        self.assertTrue(reissued.get("reissued"))
+        self.assertEqual(
+            ["План"], [question["header"] for question in reissued["questions"][:1]]
+        )
+        self.assertIn("Утвердить этот план исследования?", reissued["questions"][0]["question"])
+        self.assertIn("Правовых вопросов для исследования:", reissued["text"])
+        self.assertIn("Ответьте одним из:", reissued["text_fallback"])
+        self.assertEqual(issued["text"], reissued["text"])
+
+    def test_a_russian_intake_gate_keeps_the_english_pointer_shape(self):
+        """D-103: `_gate_reply_lines` lifts the reply format by shape, in every language."""
+        driver = self._russian_task("ui-pointer")
+        action = driver.run_until("intake_questions_pending")
+        russian = action["text"]
+        english = gates.render(
+            driver.work_dir, dict(driver.state(), ui_language="en"), "intake"
+        )
+        lines_ru = machine._gate_reply_lines(russian, True)
+        lines_en = machine._gate_reply_lines(english, True)
+        self.assertEqual(len(lines_en), len(lines_ru))
+        self.assertTrue(lines_ru[0].endswith(":"), lines_ru)
+        self.assertEqual(
+            ["Ответьте в формате `1A 2C 3: свободный текст`:",
+             "`proceed` принимает все допущения как есть. `cancel` останавливает задачу."],
+            lines_ru,
+        )
+
+    def test_the_dashboard_pointer_of_a_text_gate_is_localized(self):
+        driver = self._russian_task("ui-pointer-dashboard")
+        action = driver.run_until("intake_questions_pending")
+        state = self._with_dashboard(driver)
+        pointer = machine.gate_text(
+            driver.work_dir, state, "intake", gates.render(driver.work_dir, state, "intake")
+        )
+        self.assertIn("Ваши вводные ответы (вопросов: 2) — на панели:", pointer)
+        self.assertIn("Ответьте в формате", pointer)
+        self.assertNotIn("are on the dashboard", pointer)
+        self.assertEqual(action["phase"], "intake_questions_pending")
+
+    def test_the_plan_gate_pointer_names_the_memo_language_outside_en_en(self):
+        driver = self._russian_task("ui-plan-pointer")
+        driver.run_until("plan_approval_pending")
+        state = self._with_dashboard(driver)
+        text = machine.plan_gate_text(driver.work_dir, state)
+        self.assertIn("План исследования — на вашей панели: https://example.test/x", text)
+        self.assertIn("Язык мемо: English", text)
+        self.assertIn("Правовых вопросов: 1 · оценка сложности: high", text)
+        self.assertNotIn("рекомендуемый режим", text)
+        english = dict(state, ui_language="en")
+        self.assertNotIn("Memo language", machine.plan_gate_text(driver.work_dir, english))
+
+    def test_the_dashboard_patch_carries_labels_and_the_memo_language_off_en_en(self):
+        """D-177 (patch only): `labels` is the whole `ui.dashboard` dict; the plan card names
+        the memo language exactly when `gates.memo_language_line` prints it."""
+        from memoforge import i18n_en  # noqa: E402 - local import keeps the module header stable
+
+        from memoforge import i18n  # noqa: E402 - local import keeps the module header stable
+
+        driver = self._russian_task("ui-patch")
+        state = dict(driver.state())
+        patch = machine.dashboard_patch(state)
+        self.assertEqual(patch["labels"], i18n.node("ru", "ui.dashboard"))
+        self.assertEqual(patch["labels"]["card_your_turn"], "Ваш ход")
+        self.assertEqual(patch["status_label"], "Работаем")
+        self.assertNotIn("memo_language", patch["plan"] or {})
+        probe_plan = probe.fixture_plan()
+        state_io.write_json_atomic(driver.work_dir / gates.PLAN_PATH, probe_plan)
+        patch = machine.dashboard_patch(dict(driver.state()))
+        self.assertEqual(patch["plan"]["memo_language"], "English")
+        english = dict(driver.state(), ui_language="en")
+        before = {key: value for key, value in machine.dashboard_patch(english).items()}
+        self.assertEqual(before["labels"], i18n_en.EN["ui"]["dashboard"])
+        self.assertNotIn("memo_language", before["plan"] or {})
+
+
+class PlannerUiLanguageTest(unittest.TestCase):
+    """D-173b (UI half): the planner writes the gate-visible plan fields in the UI language."""
+
+    def _instruction(self, *, ui_language: str, language: str = "en") -> str:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        packs = Path(tmp.name)
+        _i18n.fake_pack(packs, "ru", _i18n.RU)
+        with mock.patch.object(machine.i18n, "PACK_DIR", packs):
+            work_dir = temp_root(self) / "planner-ui"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            state = {
+                "task_id": "memo-20260908T120000Z-planner-ui",
+                "user_query": "How long may the client keep customer records?",
+                "language": language,
+                "ui_language": ui_language,
+                "config": {},
+                "current_iteration": 1,
+            }
+            spec = machine.inline_spec(work_dir, state, "planning", "s-003", 1)
+            assert spec is not None
+            return spec["instruction"]
+
+    def test_the_russian_planner_prompt_names_russian_for_the_plan_fields(self):
+        instruction = self._instruction(ui_language="ru")
+        self.assertIn("Russian", instruction)
+        self.assertIn("`issues[].title`", instruction)
+        self.assertIn("`issues[].question`", instruction)
+        self.assertIn("`issue_id`", instruction)
+
+    def test_the_english_planner_prompt_names_english(self):
+        self.assertIn("English", self._instruction(ui_language="en"))
+
+    def test_the_classification_is_named_among_the_machine_fields(self):
+        """Final review, finding 1: `schemas/plan.schema.json` accepts six English values for
+        `classification`, so a planner told to write it in Russian produces a rejected plan.
+
+        The paragraph names it with `estimated_complexity` on the unchanged side, and the list
+        of fields to translate — everything between the lead and that sentence — holds only the
+        three prose fields.
+        """
+        instruction = self._instruction(ui_language="ru")
+        prose, marker, machine_fields = instruction.partition("The machine fields stay English")
+        self.assertTrue(marker, instruction)
+        self.assertIn("`classification`", machine_fields)
+        self.assertIn("`estimated_complexity`", machine_fields)
+        translated = prose.split("prints your prose verbatim", 1)[1]
+        self.assertIn("`notes` in Russian", translated)
+        for field in ("`classification`", "`estimated_complexity`", "`issue_id`", "`layer`"):
+            self.assertNotIn(field, translated, field)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,841 @@
+"""Tests for the artifact JSON schemas in schemas/ (TZ v2 §6).
+
+Run from the plugin root:
+    python -m unittest scripts.tests.test_schemas_artifacts
+
+Scope: the artifact schemas owned by this slice. `state`, `events`, `done-marker`
+and `internal` belong to other slices and are deliberately not asserted here.
+The test loads schemas directly with jsonschema and never imports
+`scripts/memoforge/schema.py`, so it stays green independently of the CLI slice.
+
+Each schema has fixtures under `fixtures/schemas/<name>/`:
+  - `valid-*.json`   must validate;
+  - `invalid-1.json` must not, and carries a `_why` field describing the
+    expected error. `_why` is itself rejected everywhere (every top-level
+    object is a self-contained branch with `additionalProperties: false`), so
+    the fixtures additionally assert that a *real* error survives removing it.
+"""
+
+from __future__ import annotations
+
+import json
+import unittest
+from pathlib import Path
+
+from jsonschema import Draft202012Validator
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[2]
+SCHEMAS_DIR = PLUGIN_ROOT / "schemas"
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "schemas"
+
+DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
+
+# Artifact -> schema rows of TZ §6 owned by this slice.
+SCHEMA_NAMES = (
+    "plan",
+    "intake-questions",
+    "mcp-probe",
+    "preflight",
+    "gate-answers",
+    "research-findings",
+    "sources",
+    "quotes",
+    "research-sufficiency",
+    "currency",
+    "source-pack",
+    "review",
+    "mediator",
+    "client-readiness",
+    "lint",
+    "style-meta",
+)
+
+
+def read_json(path: Path) -> object:
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def schema_path(name: str) -> Path:
+    return SCHEMAS_DIR / f"{name}.schema.json"
+
+
+def load_schema(name: str) -> dict:
+    return read_json(schema_path(name))
+
+
+def validator(name: str) -> Draft202012Validator:
+    return Draft202012Validator(load_schema(name))
+
+
+def errors_for(name: str, instance: object) -> list[str]:
+    return [e.message for e in validator(name).iter_errors(instance)]
+
+
+def fixture_dir(name: str) -> Path:
+    return FIXTURES_DIR / name
+
+
+def fixtures(name: str, prefix: str) -> list[Path]:
+    return sorted(fixture_dir(name).glob(f"{prefix}*.json"))
+
+
+def iter_refs(node: object):
+    """Yield every $ref string in a schema document."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "$ref" and isinstance(value, str):
+                yield value
+            else:
+                yield from iter_refs(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from iter_refs(item)
+
+
+class SchemaFilesTest(unittest.TestCase):
+    def test_every_artifact_schema_exists(self):
+        for name in SCHEMA_NAMES:
+            with self.subTest(schema=name):
+                self.assertTrue(schema_path(name).is_file(), f"missing schemas/{name}.schema.json")
+
+    def test_schemas_are_valid_draft_2020_12(self):
+        for name in SCHEMA_NAMES:
+            with self.subTest(schema=name):
+                Draft202012Validator.check_schema(load_schema(name))
+
+    def test_schemas_declare_schema_id_and_title(self):
+        for name in SCHEMA_NAMES:
+            with self.subTest(schema=name):
+                schema = load_schema(name)
+                self.assertEqual(schema.get("$schema"), DRAFT_2020_12)
+                self.assertTrue(
+                    str(schema.get("$id", "")).endswith(f"/{name}.schema.json"),
+                    f"$id of {name} must end with /{name}.schema.json, got {schema.get('$id')!r}",
+                )
+                self.assertTrue(str(schema.get("title", "")).strip(), f"{name} has no title")
+
+    def test_refs_are_local_defs_only(self):
+        # CONVENTIONS.md: "$ref — только локальные $defs".
+        for name in SCHEMA_NAMES:
+            with self.subTest(schema=name):
+                schema = load_schema(name)
+                defs = schema.get("$defs", {})
+                for ref in iter_refs(schema):
+                    self.assertTrue(ref.startswith("#/$defs/"), f"{name}: non-local $ref {ref!r}")
+                    key = ref[len("#/$defs/"):]
+                    self.assertIn(key, defs, f"{name}: $ref {ref!r} does not resolve")
+
+    def test_defs_are_used(self):
+        for name in SCHEMA_NAMES:
+            with self.subTest(schema=name):
+                schema = load_schema(name)
+                used = {ref[len("#/$defs/"):] for ref in iter_refs(schema)}
+                unused = sorted(set(schema.get("$defs", {})) - used)
+                self.assertEqual([], unused, f"{name}: unused $defs {unused}")
+
+
+class FixtureTest(unittest.TestCase):
+    def test_every_schema_has_fixtures(self):
+        for name in SCHEMA_NAMES:
+            with self.subTest(schema=name):
+                self.assertTrue(fixture_dir(name).is_dir(), f"no fixture dir for {name}")
+                self.assertTrue(fixtures(name, "valid-"), f"no valid fixture for {name}")
+                self.assertTrue(fixtures(name, "invalid-"), f"no invalid fixture for {name}")
+
+    def test_no_orphan_fixture_dirs(self):
+        found = sorted(p.name for p in FIXTURES_DIR.iterdir() if p.is_dir())
+        self.assertEqual(sorted(SCHEMA_NAMES), found)
+
+    def test_valid_fixtures_validate(self):
+        for name in SCHEMA_NAMES:
+            v = validator(name)
+            for path in fixtures(name, "valid-"):
+                with self.subTest(schema=name, fixture=path.name):
+                    errs = [f"{list(e.path)}: {e.message}" for e in v.iter_errors(read_json(path))]
+                    self.assertEqual([], errs)
+
+    def test_invalid_fixtures_are_rejected(self):
+        for name in SCHEMA_NAMES:
+            v = validator(name)
+            for path in fixtures(name, "invalid-"):
+                with self.subTest(schema=name, fixture=path.name):
+                    self.assertFalse(v.is_valid(read_json(path)), f"{path.name} should not validate")
+
+    def test_invalid_fixtures_document_the_expected_error(self):
+        for name in SCHEMA_NAMES:
+            for path in fixtures(name, "invalid-"):
+                with self.subTest(schema=name, fixture=path.name):
+                    obj = read_json(path)
+                    self.assertIsInstance(obj, dict)
+                    self.assertTrue(str(obj.get("_why", "")).strip(), f"{path.name} lacks a _why note")
+
+    def test_invalid_fixtures_fail_for_more_than_the_why_field(self):
+        # The documented defect must be real: stripping _why leaves the fixture invalid.
+        for name in SCHEMA_NAMES:
+            v = validator(name)
+            for path in fixtures(name, "invalid-"):
+                with self.subTest(schema=name, fixture=path.name):
+                    obj = {k: val for k, val in read_json(path).items() if k != "_why"}
+                    self.assertFalse(v.is_valid(obj), f"{path.name} is only invalid because of _why")
+
+    def test_why_field_is_itself_rejected(self):
+        # Every top-level object is a self-contained branch, so a comment field cannot sneak in.
+        for name in SCHEMA_NAMES:
+            v = validator(name)
+            for path in fixtures(name, "valid-"):
+                with self.subTest(schema=name, fixture=path.name):
+                    obj = dict(read_json(path))
+                    obj["_why"] = "comment fields are not part of the contract"
+                    self.assertFalse(v.is_valid(obj), f"{path.name} + _why should not validate")
+
+
+class ReviewSchemaTest(unittest.TestCase):
+    def _logic_review(self) -> dict:
+        return read_json(fixture_dir("review") / "valid-1.json")
+
+    def test_review_kind_fixtures_cover_all_reviewers(self):
+        seen = set()
+        for path in fixtures("review", "valid-"):
+            obj = read_json(path)
+            seen.add((obj["reviewer"], obj.get("status")))
+        self.assertEqual(
+            {
+                ("logic", None),
+                ("form", None),
+                ("citations", None),
+                ("counterarguments", None),
+                ("form", "failed"),
+            },
+            seen,
+        )
+
+    def test_every_issue_shape_accepts_issue_client(self):
+        # D-173a: optional `issue_client` (1–400 chars) on every issue shape: one issue per
+        # schema variant — logic, form, citations, unverified_hard_fail, counterarguments.
+        base = {
+            "logic": read_json(fixture_dir("review") / "valid-1.json"),
+            "form": read_json(fixture_dir("review") / "valid-2.json"),
+            "citations": read_json(fixture_dir("review") / "valid-3.json"),
+            "counterarguments": read_json(fixture_dir("review") / "valid-4.json"),
+        }
+        base["counterarguments"]["issues"] = [
+            {
+                "severity": "blocker",
+                "category": "missing_application",
+                "section_id": "s-4-1",
+                "issue": "The counterargument is stated but never answered.",
+                "suggestion": "Answer it.",
+                "attack_vector": "contrary_authority",
+            }
+        ]
+        unverified_issue = {
+            "severity": "blocker",
+            "category": "unverified_hard_fail",
+            "section_id": "document",
+            "issue": "Hard-fail checklist item LOG-02 was graded `unknown`.",
+            "suggestion": "Re-run the reviewer and grade LOG-02 as pass or fail.",
+            "checklist_id": "LOG-02",
+        }
+        # Which `$defs` issue shape each exercised issue validates against.
+        shapes = {
+            "logic": "logic_issue",
+            "form": "form_issue",
+            "citations": "citations_issue",
+            "counterarguments": "counterarguments_issue",
+            "unverified_hard_fail": "unverified_hard_fail_issue",
+        }
+        exercised: set[str] = set()
+        for kind, report in base.items():
+            report["verdict"] = "needs_revision"
+            report["issues"].append(dict(unverified_issue))
+            with self.subTest(kind=kind):
+                for issue in report["issues"]:
+                    issue["issue_client"] = "Der Test wird nicht angewendet."
+                self.assertEqual([], errors_for("review", report))
+                report["issues"][0]["issue_client"] = "x" * 401
+                self.assertTrue(errors_for("review", report))
+            exercised.add(shapes[kind])
+            exercised.add("unverified_hard_fail_issue")
+        self.assertEqual(set(shapes.values()), exercised)
+
+    def test_review_with_7_issues_is_valid(self):
+        # §4.5: the "<=5 major" cap is prompt guidance, never maxItems in the schema.
+        review = self._logic_review()
+        template = review["issues"][0]
+        review["issues"] = [
+            {**template, "section_id": f"s-4-{n}", "issue": f"Unapplied rule in section 4.{n}.", "severity": "major"}
+            for n in range(1, 8)
+        ]
+        self.assertEqual(7, len(review["issues"]))
+        self.assertEqual([], errors_for("review", review))
+
+    def test_review_stub_variant_valid(self):
+        stub = {
+            "reviewer": "citations",
+            "status": "failed",
+            "reason": "invalid JSON after reviewer_json_retry",
+        }
+        self.assertEqual([], errors_for("review", stub))
+
+        with_sha = dict(stub, draft_sha=self._logic_review()["draft_sha"], iteration=2)
+        self.assertEqual([], errors_for("review", with_sha))
+
+        # A stub carries no checklist, no verdict and no score (the v1 overall_score:0 defect).
+        self.assertTrue(errors_for("review", dict(stub, verdict="needs_revision")))
+        self.assertTrue(errors_for("review", dict(stub, overall_score=0)))
+        # `status` must be exactly "failed", and the stub is not a full review.
+        self.assertTrue(errors_for("review", dict(stub, status="ok")))
+        self.assertTrue(errors_for("review", {"reviewer": "citations", "status": "failed"}))
+
+    def test_citations_issue_category_is_narrowed_to_three_judgement_calls(self):
+        review = read_json(fixture_dir("review") / "valid-3.json")
+        for category in ("source_drift", "source_pack_mismatch", "unsupported_claim"):
+            with self.subTest(category=category):
+                review["issues"][0]["issue_category"] = category
+                self.assertEqual([], errors_for("review", review))
+        # Deterministic checks (audit-citations C-01..C-07) own these; the LLM no longer labels them.
+        for category in (
+            "ignored_blocking_currency",
+            "missing_in_sources_section",
+            "unverified_against_source",
+            "length_overflow_disclosure",
+        ):
+            with self.subTest(removed=category):
+                review["issues"][0]["issue_category"] = category
+                self.assertTrue(errors_for("review", review))
+
+    def test_unverified_hard_fail_issue_is_accepted_for_every_kind(self):
+        # §4.5 p.2: `unknown` on a hard_fail item makes `mf review validate` lower the verdict and
+        # add this blocker. The CLI authored it, so it carries no reviewer-specific discriminator.
+        added = {
+            "severity": "blocker",
+            "category": "unverified_hard_fail",
+            "section_id": "document",
+            "issue": "Hard-fail checklist item LOG-02 was graded `unknown`.",
+            "suggestion": "Re-run the reviewer and grade LOG-02 as pass or fail.",
+            "checklist_id": "LOG-02",
+        }
+        for path in fixtures("review", "valid-"):
+            review = read_json(path)
+            if review.get("status") == "failed":
+                continue
+            with self.subTest(fixture=path.name):
+                review["issues"] = [added]
+                review["verdict"] = "needs_revision"
+                self.assertEqual([], errors_for("review", review))
+
+        # The shape stays closed: blocker only, that one category, checklist_id required. Checked on
+        # the citations branch, whose own issue variant demands an `issue_category` discriminator.
+        for broken in (
+            dict(added, severity="major"),
+            dict(added, category="drafting"),
+            {k: v for k, v in added.items() if k != "checklist_id"},
+            dict(added, lens="clarity"),
+        ):
+            with self.subTest(broken=sorted(broken)):
+                review = read_json(fixture_dir("review") / "valid-3.json")
+                review["issues"] = [broken]
+                self.assertTrue(errors_for("review", review))
+
+    def test_text_checks_and_source_evidence_belong_to_citations_and_counterarguments(self):
+        # D-208: optional `source_evidence` on an issue and `text_checks` rows on the review, for the
+        # two reviewers that check claims against the saved text; the other two stay closed.
+        evidence = {"source_id": "src-1", "status": "contradicted", "passage": "The court held otherwise."}
+        rows = [
+            {"source_id": "src-1", "section_id": "s-4-2", "status": status, "finding_disagrees": False, "note": "n"}
+            for status in ("confirmed", "contradicted", "inconclusive", "not_reached")
+        ]
+        issue = {
+            "severity": "major",
+            "category": "overconfidence",
+            "section_id": "s-4-2",
+            "issue": "The holding is stated as settled.",
+            "suggestion": "Qualify it.",
+            "attack_vector": "overconfidence",
+        }
+        reports = {
+            "citations": read_json(fixture_dir("review") / "valid-3.json"),
+            "counterarguments": dict(read_json(fixture_dir("review") / "valid-4.json"), issues=[issue]),
+        }
+        for kind, report in reports.items():
+            with self.subTest(kind=kind):
+                report["issues"][0]["source_evidence"] = dict(evidence)
+                report["text_checks"] = [dict(row) for row in rows]
+                self.assertEqual([], errors_for("review", report))
+                report["text_checks"] = []
+                self.assertEqual([], errors_for("review", report))
+
+        for kind, name in (("logic", "valid-1.json"), ("form", "valid-2.json")):
+            with self.subTest(closed=kind):
+                report = read_json(fixture_dir("review") / name)
+                self.assertTrue(errors_for("review", dict(report, text_checks=[dict(rows[0])])))
+                report["issues"][0]["source_evidence"] = dict(evidence)
+                self.assertTrue(errors_for("review", report))
+
+    def test_text_checks_and_source_evidence_are_closed_shapes(self):
+        base_row = {
+            "source_id": "src-1",
+            "section_id": "s-4-2",
+            "status": "confirmed",
+            "finding_disagrees": True,
+            "note": "n",
+        }
+        broken_rows = (
+            dict(base_row, status="found"),
+            dict(base_row, finding_disagrees="yes"),
+            dict(base_row, section_id=""),
+            dict(base_row, note=""),
+            dict(base_row, extra=1),
+            {k: v for k, v in base_row.items() if k != "finding_disagrees"},
+            {k: v for k, v in base_row.items() if k != "note"},
+        )
+        for row in broken_rows:
+            with self.subTest(row=row):
+                report = read_json(fixture_dir("review") / "valid-3.json")
+                report["text_checks"] = [row]
+                self.assertTrue(errors_for("review", report))
+
+        base_evidence = {"source_id": "src-1", "status": "confirmed", "passage": "p" * 600}
+        report = read_json(fixture_dir("review") / "valid-3.json")
+        report["issues"][0]["source_evidence"] = base_evidence
+        self.assertEqual([], errors_for("review", report))
+        for broken in (
+            dict(base_evidence, passage="p" * 601),
+            dict(base_evidence, passage=""),
+            dict(base_evidence, status="inconclusive"),
+            dict(base_evidence, note="n"),
+            {k: v for k, v in base_evidence.items() if k != "passage"},
+        ):
+            with self.subTest(evidence=broken):
+                report["issues"][0]["source_evidence"] = broken
+                self.assertTrue(errors_for("review", report))
+
+    def test_resolutions_belong_to_the_citations_review_only(self):
+        # D-211: the citations re-check of the polish records one row per listed open finding.
+        rows = [
+            {"id": "om-1", "status": "resolved", "note": "The statement was withdrawn."},
+            {"id": "om-12", "status": "open", "note": "The pinpoint still points elsewhere."},
+        ]
+        report = read_json(fixture_dir("review") / "valid-3.json")
+        self.assertEqual("citations", report["reviewer"])
+        self.assertEqual([], errors_for("review", dict(report, resolutions=rows)))
+        self.assertEqual([], errors_for("review", dict(report, resolutions=[])))
+        for broken in (
+            dict(rows[0], status="unresolved"),
+            dict(rows[0], id="om-0"),
+            dict(rows[0], id="s-3"),
+            dict(rows[0], note=""),
+            dict(rows[0], extra=1),
+            {key: value for key, value in rows[0].items() if key != "note"},
+        ):
+            with self.subTest(row=broken):
+                self.assertTrue(errors_for("review", dict(report, resolutions=[broken])))
+        for name in ("valid-1.json", "valid-2.json", "valid-4.json"):
+            with self.subTest(closed=name):
+                other = read_json(fixture_dir("review") / name)
+                self.assertTrue(errors_for("review", dict(other, resolutions=rows)))
+
+    def test_review_branches_are_mutually_exclusive(self):
+        # A form-only lens on a logic issue must match no branch of the oneOf.
+        review = self._logic_review()
+        review["issues"][0]["lens"] = "clarity"
+        self.assertTrue(errors_for("review", review))
+
+    def test_review_requires_draft_sha_and_reasoning(self):
+        for missing in ("draft_sha", "reasoning", "checklist", "issues", "verdict"):
+            with self.subTest(missing=missing):
+                review = self._logic_review()
+                review.pop(missing)
+                self.assertTrue(errors_for("review", review))
+
+    def test_reasoning_is_the_first_key_in_full_review_fixtures(self):
+        # JSON objects are unordered, but the emitted contract puts reasoning first (§4.5).
+        for path in fixtures("review", "valid-"):
+            obj = read_json(path)
+            if obj.get("status") == "failed":
+                continue
+            with self.subTest(fixture=path.name):
+                self.assertEqual("reasoning", next(iter(obj)))
+
+
+class ClientReadinessSchemaTest(unittest.TestCase):
+    def _report(self) -> dict:
+        return read_json(fixture_dir("client-readiness") / "valid-1.json")
+
+    def test_reasoning_is_first_and_required(self):
+        report = self._report()
+        self.assertEqual("reasoning", next(iter(report)))
+        report.pop("reasoning")
+        self.assertTrue(errors_for("client-readiness", report))
+
+    def test_checklist_is_optional_but_shaped_like_the_review_one(self):
+        report = self._report()
+        report.pop("checklist")
+        self.assertEqual([], errors_for("client-readiness", report))
+
+        report = self._report()
+        self.assertEqual({"id", "pass", "evidence"}, set(report["checklist"][0]))
+        for value in (True, False, "unknown"):
+            with self.subTest(pass_value=value):
+                report["checklist"][0]["pass"] = value
+                self.assertEqual([], errors_for("client-readiness", report))
+        report["checklist"][0]["pass"] = "maybe"
+        self.assertTrue(errors_for("client-readiness", report))
+
+    def test_every_issue_carries_a_section_id(self):
+        report = self._report()
+        report["issues"][0].pop("section_id")
+        self.assertTrue(errors_for("client-readiness", report))
+
+    def test_an_issue_may_carry_a_client_sentence(self):
+        # D-173a: optional `issue_client` (1–400 chars).
+        report = self._report()
+        report["issues"][0]["issue_client"] = "Der Test wird nicht angewendet."
+        self.assertEqual([], errors_for("client-readiness", report))
+        report["issues"][0]["issue_client"] = "x" * 401
+        self.assertTrue(errors_for("client-readiness", report))
+
+    def test_dispositions_are_optional_closed_rows(self):
+        # D-211: one disposition per open finding of the review loop; a report without them is valid.
+        report = self._report()
+        self.assertNotIn("dispositions", report)
+        self.assertEqual([], errors_for("client-readiness", report))
+        rows = [
+            {"id": "om-1", "action": "polish", "note": "Soften the rule in 4.2."},
+            {"id": "om-2", "action": "manual_review", "note": "A lawyer checks the pinpoint."},
+            {"id": "om-3", "action": "leave", "note": "The objection is answered in 6.1."},
+        ]
+        self.assertEqual([], errors_for("client-readiness", dict(report, dispositions=rows)))
+        for broken in (
+            dict(rows[0], action="rewrite"),
+            dict(rows[0], id="om-01"),
+            dict(rows[0], note=""),
+            dict(rows[0], extra=1),
+            {key: value for key, value in rows[0].items() if key != "action"},
+        ):
+            with self.subTest(row=broken):
+                self.assertTrue(errors_for("client-readiness", dict(report, dispositions=[broken])))
+
+
+class OpenSubstanceMajorRowSchemaTest(unittest.TestCase):
+    """D-213: `severity`, `blocker_of` and `disposition_note` are optional fields of an open-finding row."""
+
+    ROW = {
+        "id": "om-4",
+        "class": "citations",
+        "reviewer": "citations",
+        "section_id": "s-4-2",
+        "category": "rule_not_in_source",
+        "issue_category": "unsupported_claim",
+        "issue": "Section 168(2)-(3) confers no power to bring proceedings.",
+        "issue_client": None,
+        "suggestion": "Withdraw the statement or qualify it.",
+        "from_iteration": 3,
+        "origin": "loop",
+        "status": "open",
+    }
+    LINK = {"section_id": "s-4-2", "category": "rule_not_in_source", "issue": ROW["issue"]}
+
+    def errors(self, row: dict) -> list[str]:
+        definitions = load_schema("state")["$defs"]
+        schema = {"$defs": definitions, "$ref": "#/$defs/open_substance_major"}
+        return [error.message for error in Draft202012Validator(schema).iter_errors(row)]
+
+    def test_a_row_written_before_d213_is_valid(self):
+        self.assertEqual([], self.errors(dict(self.ROW)))
+
+    def test_the_new_fields_are_accepted(self):
+        row = dict(self.ROW, severity="blocker", blocker_of=dict(self.LINK), disposition_note="Withdrawn in 4.2.")
+        self.assertEqual([], self.errors(row))
+        self.assertEqual([], self.errors(dict(self.ROW, disposition_note="A lawyer checks the pinpoint.")))
+
+    def test_the_new_fields_are_closed(self):
+        for broken in (
+            dict(self.ROW, severity="major"),
+            dict(self.ROW, severity="blocker", blocker_of={"section_id": "s-4-2", "issue": "x"}),
+            dict(self.ROW, severity="blocker", blocker_of=dict(self.LINK, extra=1)),
+            dict(self.ROW, disposition_note=7),
+        ):
+            with self.subTest(row=broken):
+                self.assertTrue(self.errors(broken))
+
+
+class QuotesSchemaTest(unittest.TestCase):
+    def _skip(self, **overrides) -> dict:
+        skip = {
+            "section_id": "s-4-2",
+            "source_id": "gdpr-art-6",
+            "reason": "too_long",
+            "at": "2026-09-08T11:12:00Z",
+        }
+        skip.update(overrides)
+        return {"quotes": {}, "skips": [skip]}
+
+    def test_quotes_skip_other_requires_note(self):
+        self.assertTrue(errors_for("quotes", self._skip(reason="other")))
+        self.assertEqual([], errors_for("quotes", self._skip(reason="other", note="paywalled source")))
+        # Every other reason stands on its own without a note.
+        for reason in ("too_long", "ambiguous", "not_found", "no_raw", "raw_changed", "already_used"):
+            with self.subTest(reason=reason):
+                self.assertEqual([], errors_for("quotes", self._skip(reason=reason)))
+
+    def test_quotes_skip_reason_enum_is_closed(self):
+        self.assertTrue(errors_for("quotes", self._skip(reason="too-long")))
+
+
+class PdfOriginalSchemaTest(unittest.TestCase):
+    """D-201: the original a PDF save keeps, in the registry and in the freeze snapshot."""
+
+    SHA = "9216ab6a5bb553658b572b3be8c98a474dff7358416c05223b034c705438fdda"
+
+    def registry(self, **overrides) -> dict:
+        document = read_json(fixture_dir("sources") / "valid-1.json")
+        document["sources"]["gdpr-art-6"].update(overrides)
+        return document
+
+    def test_a_record_may_carry_the_original_it_was_served(self):
+        self.assertEqual(
+            [],
+            errors_for(
+                "sources",
+                self.registry(
+                    raw_original_path="research/raw/case_law/vsrf-act.pdf",
+                    raw_original_sha256=self.SHA,
+                ),
+            ),
+        )
+
+    def test_a_malformed_original_digest_is_rejected(self):
+        self.assertTrue(errors_for("sources", self.registry(raw_original_sha256="not-a-digest")))
+        self.assertTrue(errors_for("sources", self.registry(raw_original_path="")))
+
+    def test_a_registry_written_before_this_task_still_validates(self):
+        self.assertEqual([], errors_for("sources", self.registry()))
+
+    def test_the_snapshot_may_pin_the_original_next_to_the_text(self):
+        pack = read_json(fixture_dir("source-pack") / "valid-1.json")
+        self.assertEqual([], errors_for("source-pack", pack), "an old pack keeps validating")
+        pack["snapshot"][0]["raw_original_sha256"] = self.SHA
+        self.assertEqual([], errors_for("source-pack", pack))
+        pack["snapshot"][0]["raw_original_sha256"] = "nope"
+        self.assertTrue(errors_for("source-pack", pack))
+
+    def warning(self, was: str, now: str) -> dict:
+        pack = read_json(fixture_dir("source-pack") / "valid-1.json")
+        pack["integrity_warnings"] = [
+            {"code": "full_text_integrity", "source_id": "gdpr-art-6", "was": was, "now": now}
+        ]
+        return pack
+
+    def test_an_integrity_warning_may_name_a_kind_that_was_never_full_text(self):
+        """D-201: a scan that changed is warned about although there is nothing to demote."""
+        for kind in ("none", "excerpt", "agent_summary", "client_file"):
+            with self.subTest(kind=kind):
+                self.assertEqual([], errors_for("source-pack", self.warning(kind, kind)))
+        self.assertTrue(errors_for("source-pack", self.warning("invented", "invented")))
+
+    def test_the_demotion_of_d_200_is_still_the_only_transition_allowed(self):
+        """Fix round 1: widening the pair must not let an impossible transition through."""
+        for now in ("agent_summary", "none"):
+            with self.subTest(now=now):
+                self.assertEqual([], errors_for("source-pack", self.warning("full_text", now)))
+        for was, now in (
+            ("none", "full_text"),  # nothing is ever promoted by the freeze
+            ("none", "agent_summary"),  # only `full_text` is ever demoted
+            ("excerpt", "none"),
+            ("full_text", "full_text"),  # a warning always records a change
+            ("agent_summary", "excerpt"),
+        ):
+            with self.subTest(was=was, now=now):
+                self.assertTrue(errors_for("source-pack", self.warning(was, now)), f"{was} -> {now}")
+
+
+class SufficiencySchemaTest(unittest.TestCase):
+    def test_user_targeted_gap_needs_a_followup_question(self):
+        report = read_json(fixture_dir("research-sufficiency") / "valid-1.json")
+        report["blocking_gaps"][0]["followup_question"] = None
+        self.assertTrue(errors_for("research-sufficiency", report))
+
+    def test_layer_targeted_gap_may_omit_the_followup_question(self):
+        report = read_json(fixture_dir("research-sufficiency") / "valid-1.json")
+        report["blocking_gaps"] = [g for g in report["blocking_gaps"] if g["target"] != "user"]
+        report["overall_verdict"] = "sufficient"
+        self.assertEqual([], errors_for("research-sufficiency", report))
+
+
+class IntakeQuestionsSchemaTest(unittest.TestCase):
+    def _question(self, **overrides) -> dict:
+        question = read_json(fixture_dir("intake-questions") / "valid-1.json")["must_answer"][0]
+        question.update(overrides)
+        return {"must_answer": [question], "optional": [], "default_assumptions_if_skipped": []}
+
+    def test_header_limit_is_twelve_characters(self):
+        self.assertEqual([], errors_for("intake-questions", self._question(header="Train vs use")))
+        self.assertTrue(errors_for("intake-questions", self._question(header="Art. 27 + DPIA")))
+
+    def test_options_are_two_to_four(self):
+        option = {"label": "Yes", "description": "One sentence."}
+        self.assertTrue(errors_for("intake-questions", self._question(options=[option])))
+        self.assertEqual([], errors_for("intake-questions", self._question(options=[option] * 4)))
+        self.assertTrue(errors_for("intake-questions", self._question(options=[option] * 5)))
+
+    def test_option_description_limit_is_200_characters(self):
+        long_option = {"label": "Yes", "description": "x" * 201}
+        self.assertTrue(errors_for("intake-questions", self._question(options=[long_option, long_option])))
+
+    def test_impact_default_and_confidence_are_required(self):
+        """D-05/D-15: `default_if_wrong` feeds the intake gate line, so it is required too."""
+        for field in ("impact", "default", "default_if_wrong", "confidence"):
+            with self.subTest(field=field):
+                payload = self._question()
+                payload["must_answer"][0].pop(field)
+                self.assertTrue(errors_for("intake-questions", payload))
+
+
+class ResearchFindingsSchemaTest(unittest.TestCase):
+    def _findings(self) -> dict:
+        return read_json(fixture_dir("research-findings") / "valid-1.json")
+
+    def test_quote_short_caps_at_fifteen_words(self):
+        payload = self._findings()
+        finding = payload["issues"][0]["findings"][0]
+        finding["quote_short"] = " ".join(f"w{n}" for n in range(15))
+        self.assertEqual([], errors_for("research-findings", payload))
+        finding["quote_short"] = " ".join(f"w{n}" for n in range(16))
+        self.assertTrue(errors_for("research-findings", payload))
+
+    def test_excluded_issue_id_may_be_null(self):
+        """D-114: an exclusion that maps to no planned issue carries `issue_id: null`."""
+        payload = self._findings()
+        payload["considered_excluded"][0]["issue_id"] = None
+        self.assertEqual([], errors_for("research-findings", payload))
+
+    def test_excluded_entry_still_needs_its_title(self):
+        payload = self._findings()
+        payload["considered_excluded"][0].pop("title")
+        self.assertTrue(errors_for("research-findings", payload))
+
+    def test_meta_identity_is_required(self):
+        payload = self._findings()
+        payload.pop("_meta")
+        self.assertTrue(errors_for("research-findings", payload))
+        for field in ("task_id", "step_id", "attempt", "slot"):
+            with self.subTest(field=field):
+                payload = self._findings()
+                payload["_meta"].pop(field)
+                self.assertTrue(errors_for("research-findings", payload))
+
+
+class SourcesSchemaTest(unittest.TestCase):
+    def _sources(self) -> dict:
+        return read_json(fixture_dir("sources") / "valid-1.json")
+
+    def test_registry_fields_of_tz_5_3_are_enforced(self):
+        payload = self._sources()
+        record = payload["sources"]["gdpr-art-6"]
+        for field in ("provenance", "liveness", "verification", "tier", "raw_sha256"):
+            with self.subTest(field=field):
+                broken = self._sources()
+                broken["sources"]["gdpr-art-6"].pop(field)
+                self.assertTrue(errors_for("sources", broken))
+        self.assertEqual(
+            {"us", "us_by", "eu_syntax_ok", "checked_at"},
+            set(record["verification"]),
+        )
+
+    def test_raw_kind_is_an_optional_closed_enum_of_the_record(self):
+        """D-200: the field is declared, closed, and absent by default — an old registry validates."""
+        payload = self._sources()
+        self.assertNotIn("raw_kind", payload["sources"]["gdpr-art-6"])
+        self.assertEqual([], errors_for("sources", payload))
+
+        payload = self._sources()
+        payload["sources"]["gdpr-art-6"]["raw_kind"] = "full_text"
+        self.assertEqual([], errors_for("sources", payload))
+
+        payload = self._sources()
+        payload["sources"]["gdpr-art-6"]["raw_kind"] = "wrong"
+        self.assertTrue(errors_for("sources", payload))
+
+    def test_raw_kind_is_an_optional_closed_enum_of_the_pack_entry(self):
+        """D-200: same three shapes for a pack entry — an old frozen pack validates."""
+        payload = read_json(fixture_dir("source-pack") / "valid-1.json")
+        self.assertNotIn("raw_kind", payload["entries"][0])
+        self.assertEqual([], errors_for("source-pack", payload))
+
+        payload = read_json(fixture_dir("source-pack") / "valid-1.json")
+        payload["entries"][0]["raw_kind"] = "full_text"
+        self.assertEqual([], errors_for("source-pack", payload))
+
+        payload = read_json(fixture_dir("source-pack") / "valid-1.json")
+        payload["entries"][0]["raw_kind"] = "wrong"
+        self.assertTrue(errors_for("source-pack", payload))
+
+    def test_retrieved_from_is_an_optional_string_of_the_record(self):
+        """D-192: the endpoint address the public url rule kept out of `url`."""
+        payload = self._sources()
+        payload["sources"]["gdpr-art-6"]["retrieved_from"] = "https://mcp.casus.legal/case/34232"
+        self.assertEqual([], errors_for("sources", payload))
+
+        payload = self._sources()
+        payload["sources"]["gdpr-art-6"]["retrieved_from"] = 7
+        self.assertTrue(errors_for("sources", payload))
+
+    def test_the_pack_entry_carries_retrieved_from_too(self):
+        payload = read_json(fixture_dir("source-pack") / "valid-1.json")
+        payload["entries"][0]["retrieved_from"] = "https://mcp.casus.legal/case/34232"
+        self.assertEqual([], errors_for("source-pack", payload))
+
+        payload = read_json(fixture_dir("source-pack") / "valid-1.json")
+        payload["entries"][0]["retrieved_from"] = None
+        self.assertTrue(errors_for("source-pack", payload))
+
+    def test_tool_meta_stays_open_but_pack_is_closed(self):
+        payload = self._sources()
+        payload["sources"]["gdpr-art-6"]["meta"]["repealed_by"] = "CELEX:32024R1689"
+        self.assertEqual([], errors_for("sources", payload))
+
+        payload = self._sources()
+        payload["sources"]["gdpr-art-6"]["pack"]["score"] = 7
+        self.assertTrue(errors_for("sources", payload))
+
+
+class McpProbeRuServersTest(unittest.TestCase):
+    """D-184: the RU servers are keys of `mcp-probe` — a document carrying them validates."""
+
+    def test_a_probe_document_carrying_casus_and_fas_validates(self):
+        document = {
+            "namespaces": {
+                "casus": "mcp__claude_ai_CasusLegal",
+                "fas": "mcp__plugin_memoforge_fas-search",
+                "other": [],
+            },
+            "status": {"casus": "ok", "fas": "ok"},
+            "probed_at": "2026-09-18T10:00:00Z",
+        }
+        self.assertEqual([], errors_for("mcp-probe", document))
+
+
+class StyleMetaModeBindingTest(unittest.TestCase):
+    """D-244 / R1: `mode_binding` is optional and ignored; an old profile carrying it stays valid."""
+
+    def test_a_meta_without_mode_binding_validates(self):
+        meta = read_json(fixture_dir("style-meta") / "valid-1.json")
+        self.assertNotIn("mode_binding", meta)
+        self.assertEqual([], errors_for("style-meta", meta))
+
+    def test_an_old_meta_with_either_binding_validates(self):
+        meta = read_json(fixture_dir("style-meta") / "valid-2.json")
+        self.assertEqual("brief", meta["mode_binding"])
+        for binding in ("brief", "full"):
+            with self.subTest(binding=binding):
+                self.assertEqual([], errors_for("style-meta", dict(meta, mode_binding=binding)))
+
+    def test_the_invalid_fixture_fails_on_its_input_type(self):
+        meta = {k: v for k, v in read_json(fixture_dir("style-meta") / "invalid-1.json").items() if k != "_why"}
+        self.assertTrue(errors_for("style-meta", meta))
+        self.assertEqual([], errors_for("style-meta", dict(meta, input_type="examples")))
+
+
+if __name__ == "__main__":
+    unittest.main()

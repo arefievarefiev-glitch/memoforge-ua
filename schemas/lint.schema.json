@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gregmos/memoforge/schemas/lint.schema.json",
+  "title": "memoforge lint.json / citations.json",
+  "description": "Deterministic checker report; the same shape serves `mf draft lint` (L-rules) and `mf draft audit-citations` (C-rules). `clean` is true when there is no blocker finding (TZ v1.5 section 5.4).",
+  "type": "object",
+  "required": ["draft_sha", "clean", "findings"],
+  "additionalProperties": false,
+  "properties": {
+    "draft_sha": {
+      "description": "sha of the draft the findings belong to; consumers refuse a report whose sha is stale.",
+      "$ref": "#/$defs/sha256"
+    },
+    "clean": { "type": "boolean" },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "finding": {
+      "type": "object",
+      "required": ["rule", "severity", "line", "section_id", "excerpt", "hint"],
+      "additionalProperties": false,
+      "properties": {
+        "rule": {
+          "description": "L-01..L-15 lint, C-01..C-09 citation audit, B-01..B-10 decision-brief lint.",
+          "type": "string",
+          "pattern": "^[LCB]-[0-9]{2}$"
+        },
+        "severity": {
+          "description": "`info` is a finding that is recorded but neither blocks nor counts as a defect (D34-10); no rule grades `info` since D-243.",
+          "enum": ["blocker", "major", "minor", "info"]
+        },
+        "line": {
+          "description": "1-based line in the draft; null for findings that are not bound to a line (for example C-07).",
+          "anyOf": [{ "type": "null" }, { "type": "integer", "minimum": 1 }]
+        },
+        "section_id": {
+          "anyOf": [{ "type": "null" }, { "type": "string", "minLength": 1 }]
+        },
+        "excerpt": {
+          "description": "The draft text the finding points at; null when the finding could not be located in the draft (D34-10).",
+          "anyOf": [{ "type": "null" }, { "type": "string" }]
+        },
+        "hint": { "type": "string", "minLength": 1 },
+        "source_id": {
+          "description": "C-09 only (D-204): the id the `[[src:]]` token names, whose saved text lacks the number.",
+          "type": "string",
+          "minLength": 1
+        },
+        "pinpoint": {
+          "description": "C-09 only (D-204): the pinpoint as the draft wrote it; the appendix line prints it.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}
