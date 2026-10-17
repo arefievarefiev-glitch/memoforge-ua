@@ -83,8 +83,9 @@ OPTION_KEYS: tuple[str, ...] = (
     "dashboard",
     "stop_guard",
     "websearch_autoallow",
+    "notebooklm_notebook",
 )
-"""The ten options declared in `.claude-plugin/plugin.json`, in manifest order (§8.4, D-109, D-152, D-169)."""
+"""The eleven options declared in `.claude-plugin/plugin.json`, in manifest order (§8.4, D-109, D-152, D-169)."""
 
 BOOL_OPTIONS: frozenset = frozenset(("dashboard", "stop_guard", "websearch_autoallow"))
 
@@ -104,6 +105,7 @@ OPTION_DEFAULTS: dict = {
     "dashboard": "true",
     "stop_guard": "false",
     "websearch_autoallow": "true",
+    "notebooklm_notebook": "",
 }
 """Manifest defaults of §8.4; `output_folder` has none — its default is the §2.5 chain itself, and
 the empty `publish_folder` means «the host's outputs area if there is one, else copy nothing» (D-109)."""
@@ -141,7 +143,7 @@ def read_options_file(path: str | os.PathLike | None = None) -> dict:
 
 
 def resolve_options(flags: dict | None = None, *, path: str | os.PathLike | None = None) -> dict:
-    """Resolve the ten options: CLI flags > `CLAUDE_PLUGIN_OPTION_*` > `options.json` > defaults.
+    """Resolve the eleven options: CLI flags > `CLAUDE_PLUGIN_OPTION_*` > `options.json` > defaults.
 
     D-91: a host exports the option variables to hooks only, so `options.json` (written by
     `hooks/ensure_deps.py`, or by hand through `mf config set`) is what a `Bash`-launched `mf`

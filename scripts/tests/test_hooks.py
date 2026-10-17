@@ -1277,8 +1277,9 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(user_config["ui_language"]["default"], "auto")
         self.assertEqual(
             sorted(user_config),
-            ["citation_style", "dashboard", "memo_language", "output_folder", "publish_folder",
-             "source_review_gate", "stop_guard", "ui_language", "websearch_autoallow", "writer_model"],
+            ["citation_style", "dashboard", "memo_language", "notebooklm_notebook", "output_folder",
+             "publish_folder", "source_review_gate", "stop_guard", "ui_language", "websearch_autoallow",
+             "writer_model"],
         )
 
     def test_the_manifest_the_chain_and_the_session_hook_list_the_same_options(self):

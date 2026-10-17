@@ -238,6 +238,8 @@ _DEFAULT_EXTRAS: dict[str, str] = {
     "mcp_spent": "none yet",
     # D-147: filled in from `intake/preflight.json`; without one, nothing was measured.
     "source_access": "not checked",
+    # The user's NotebookLM notebook (title, UUID or link); `none` leaves the researchers' NotebookLM rules inactive.
+    "user_notebook": "none",
     "followup_prompts": "none",
     "followup_gaps": "none",  # D-154: filled only on a sufficiency re-dispatch
     "previous_findings": "none - first pass of this layer",

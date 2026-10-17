@@ -77,6 +77,11 @@
       "type": "boolean",
       "default": true,
       "description": "Auto-approve WebSearch while a memoforge task is active."
+    },
+    "notebooklm_notebook": {
+      "title": "NotebookLM notebook",
+      "type": "string",
+      "description": "Title, link or id of your NotebookLM notebook. When set and the NotebookLM connector is available, the researchers also look for sources in this notebook and register the source texts they rely on. Empty: the notebook is not used. A single task can name another notebook in the request."
     }
   }
 }

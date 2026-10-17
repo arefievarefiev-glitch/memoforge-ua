@@ -407,6 +407,13 @@
             "null"
           ]
         },
+        "notebooklm_notebook": {
+          "description": "Title, UUID or URL of the user's NotebookLM notebook the researchers search; empty or null means none.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "style_profile": {
           "type": [
             "string",

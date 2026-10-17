@@ -2567,6 +2567,7 @@ def researcher_specs(work_dir: Path, state: dict, layers: list[str]) -> list[dic
         gaps_by_layer.setdefault(str(gap.get("target")), []).append(line)
     # D-147: the researcher is told which routed portal did not answer today, before it tries.
     source_access = preflight.source_access_line(work_dir, state)
+    user_notebook = str((state.get("config") or {}).get("notebooklm_notebook") or "").strip() or "none"
     specs = []
     for layer in layers:
         table = _routing_table(routing.routing_for([layer], plan.get("jurisdictions") or []))
@@ -2591,6 +2592,7 @@ def researcher_specs(work_dir: Path, state: dict, layers: list[str]) -> list[dic
                 routing=table,
                 mcp_namespaces=_mcp_namespaces(work_dir),
                 source_access=source_access,
+                user_notebook=user_notebook,
                 followup_prompts=user_response,
                 followup_gaps=("\n" + "\n".join(gaps)) if gaps else "none",
                 previous_findings=previous_findings,

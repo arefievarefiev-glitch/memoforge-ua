@@ -53,6 +53,7 @@ _USER_CONFIG_PASSTHROUGH: tuple[tuple[str, object], ...] = (
     ("style_profile", None),
     ("style_profile_path", None),
     ("citation_style", None),
+    ("notebooklm_notebook", None),
 )
 
 CITATION_STYLES: tuple[str, ...] = ("footnotes", "inline")
